@@ -81,6 +81,43 @@ if SEED is not None:
 import re, os, shutil
 from transformers import TrainerCallback
 
+
+class ReduceLROnPlateauCallback(TrainerCallback):
+    def __init__(self, monitor="eval_mean_iou", factor=0.5, patience=5, min_lr=1e-7, threshold=1e-4):
+        self.monitor = monitor
+        self.factor = factor
+        self.patience = patience
+        self.min_lr = min_lr
+        self.threshold = threshold
+        self.best = None
+        self.bad_count = 0
+        self.trainer = None  # <-- add
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics or self.monitor not in metrics or self.trainer is None:
+            return control
+
+        val = float(metrics[self.monitor])
+
+        if self.best is None or val > self.best + self.threshold:
+            self.best = val
+            self.bad_count = 0
+            return control
+
+        self.bad_count += 1
+        if self.bad_count < self.patience:
+            return control
+
+        opt = self.trainer.optimizer
+        for pg in opt.param_groups:
+            pg["lr"] = max(self.min_lr, float(pg["lr"]) * self.factor)
+
+        print(f"[ReduceLROnPlateau] {self.monitor} plateaued. LR -> {opt.param_groups[0]['lr']:.3e}")
+        self.bad_count = 0
+        return control
+
+
+    
 def max_checkpoint_step(out_dir: str) -> int:
     """Return the largest N from checkpoint-N in out_dir, or 0 if none."""
     if not os.path.isdir(out_dir):
@@ -421,39 +458,35 @@ class ComponentSwapPaste(A.DualTransform):
 
     
 class OffsetCheckpointNamer(TrainerCallback):
-    """
-    Renames newly-saved checkpoints checkpoint-S to checkpoint-(OFFSET+S),
-    so fresh training doesn't overwrite earlier runs.
-    """
     def __init__(self, output_dir: str, offset: int):
         self.output_dir = output_dir
         self.offset = int(offset)
-        self._done = set()  # avoid renaming twice
+        self._renamed_steps = set()
 
     def on_save(self, args, state, control, **kwargs):
-        # Trainer just saved checkpoint-{state.global_step}
         step = int(state.global_step)
+
+        # avoid renaming same step twice
+        if step in self._renamed_steps:
+            return control
+
         src = os.path.join(self.output_dir, f"checkpoint-{step}")
         if not os.path.isdir(src):
-            return control  # nothing to do
-
-        # Don't reprocess if already renamed
-        if src in self._done:
             return control
 
         dst_step = self.offset + step
         dst = os.path.join(self.output_dir, f"checkpoint-{dst_step}")
 
-        # If destination exists, bump until free
         while os.path.exists(dst):
             dst_step += 1
             dst = os.path.join(self.output_dir, f"checkpoint-{dst_step}")
 
         shutil.move(src, dst)
-        self._done.add(dst)
+        self._renamed_steps.add(step)
 
-        print(f"[checkpoint rename] {os.path.basename(src)} -> {os.path.basename(dst)} (offset={self.offset})")
+        print(f"[checkpoint rename] checkpoint-{step} -> checkpoint-{dst_step} (offset={self.offset})")
         return control
+
 
     
 class PatchGaussianNoise(A.DualTransform):
@@ -1027,12 +1060,10 @@ def main():
         save_steps=args.save_steps,
         logging_steps=args.logging_steps,
 
-        load_best_model_at_end=True,
+        load_best_model_at_end=False,
         push_to_hub=args.push_to_hub,
         report_to=["none"],
-        seed=args.seed,
-        lr_scheduler_type="cosine",        # or "linear"
-        warmup_ratio=0.0                 # or warmup_steps=...
+        seed=args.seed
             
     )
 
@@ -1047,25 +1078,31 @@ def main():
     import re
     
     def latest_checkpoint(out_dir: str):
+        """
+        Return the checkpoint-* folder with the most recent modification time.
+        (Not the largest number.)
+        """
         if not os.path.isdir(out_dir):
             return None
 
-        best_path = None
-        best_step = -1
+        ckpts = []
 
         for name in os.listdir(out_dir):
             m = re.match(r"checkpoint-(\d+)$", name)
             if not m:
                 continue
 
-            step = int(m.group(1))
             path = os.path.join(out_dir, name)
+            if os.path.isdir(path):
+                mtime = os.path.getmtime(path)
+                ckpts.append((mtime, path))
 
-            if os.path.isdir(path) and step > best_step:
-                best_step = step
-                best_path = path
+        if not ckpts:
+            return None
 
-        return best_path
+        ckpts.sort(reverse=True)  # newest first
+        return ckpts[0][1]
+
 
     
     ckpt = latest_checkpoint(args.output_dir)
@@ -1073,6 +1110,14 @@ def main():
     offset = max_checkpoint_step(args.output_dir)
     print(f"[checkpoint offset] max existing checkpoint step in {args.output_dir} = {offset}")
     trainer.add_callback(OffsetCheckpointNamer(args.output_dir, offset))
+    lr_cb = ReduceLROnPlateauCallback(
+        monitor="eval_mean_iou",
+        factor=0.7,
+        patience=3,
+        min_lr=1e-7
+    )
+    trainer.add_callback(lr_cb)
+    lr_cb.trainer = trainer
 
     if ckpt:
         print("Loading WEIGHTS ONLY from:", ckpt)
