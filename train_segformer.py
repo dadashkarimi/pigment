@@ -64,8 +64,8 @@ PREFER_ELONGATED = True  # bias sampling toward long fibers
 # --- ROI warp params (heavy warping) ---
 ROI_MARGIN = 8
 PAD = 96
-ELASTIC_ALPHA = 600
-ELASTIC_SIGMA = 8
+ELASTIC_ALPHA = 250
+ELASTIC_SIGMA = 4
 ELASTIC_ALPHA_AFFINE = 0  # keep 0 for micro-local realism
 
 # --- Seam handling ---
@@ -80,6 +80,85 @@ if SEED is not None:
     
 import re, os, shutil
 from transformers import TrainerCallback
+
+
+import numpy as np
+import cv2
+import albumentations as A
+
+
+import numpy as np
+import cv2
+import albumentations as A
+
+import copy
+import torch.nn.functional as F
+
+
+from transformers import Trainer
+
+from sklearn.mixture import GaussianMixture
+
+from sklearn.mixture import GaussianMixture
+import numpy as np
+import cv2
+import albumentations as A
+
+IGNORE = 255
+
+import os, re
+
+import os, re, shutil
+from transformers import TrainerCallback
+
+class OffsetCheckpointNamer(TrainerCallback):
+    """
+    After each checkpoint is saved, rename:
+      output_dir/checkpoint-STEP  ->  output_dir/checkpoint-(STEP + offset)
+
+    This is useful when you "continue training" but want step numbers to keep increasing
+    even though you are NOT using resume_from_checkpoint (fresh optimizer/LR).
+    """
+    def __init__(self, output_dir: str, offset: int):
+        self.output_dir = output_dir
+        self.offset = int(offset)
+
+    def on_save(self, args, state, control, **kwargs):
+        # state.global_step is the step that was just saved as checkpoint-<global_step>
+        step = int(state.global_step)
+        src = os.path.join(self.output_dir, f"checkpoint-{step}")
+        if not os.path.isdir(src):
+            return control
+
+        new_step = step + self.offset
+        dst = os.path.join(self.output_dir, f"checkpoint-{new_step}")
+
+        # If destination already exists, don't clobber it
+        if os.path.exists(dst):
+            print(f"[OffsetCheckpointNamer] dst exists, skipping: {dst}")
+            return control
+
+        # Rename/move folder
+        shutil.move(src, dst)
+
+        # Also fix trainer_state.json path inside the checkpoint if it exists (optional)
+        ts = os.path.join(dst, "trainer_state.json")
+        if os.path.isfile(ts):
+            try:
+                with open(ts, "r", encoding="utf-8") as f:
+                    s = f.read()
+                # This is a light-touch fix; safe if it doesn't match.
+                s2 = re.sub(r'"global_step"\s*:\s*\d+', f'"global_step": {new_step}', s)
+                if s2 != s:
+                    with open(ts, "w", encoding="utf-8") as f:
+                        f.write(s2)
+            except Exception as e:
+                print(f"[OffsetCheckpointNamer] trainer_state.json update failed: {e}")
+
+        print(f"[OffsetCheckpointNamer] {src} -> {dst}")
+        return control
+
+    
 
 
 class ReduceLROnPlateauCallback(TrainerCallback):
@@ -118,24 +197,499 @@ class ReduceLROnPlateauCallback(TrainerCallback):
 
 
     
+def set_dropout(model, hidden=0.2, attn=0.2, classifier=0.3):
+    if hasattr(model.config, "hidden_dropout_prob"):
+        model.config.hidden_dropout_prob = hidden
+    if hasattr(model.config, "attention_probs_dropout_prob"):
+        model.config.attention_probs_dropout_prob = attn
+    if hasattr(model.config, "classifier_dropout_prob"):
+        model.config.classifier_dropout_prob = classifier
+
+    print("Dropout settings:")
+    print("hidden:", getattr(model.config, "hidden_dropout_prob", None))
+    print("attention:", getattr(model.config, "attention_probs_dropout_prob", None))
+    print("classifier:", getattr(model.config, "classifier_dropout_prob", None))
+
 def max_checkpoint_step(out_dir: str) -> int:
     """Return the largest N from checkpoint-N in out_dir, or 0 if none."""
     if not os.path.isdir(out_dir):
         return 0
+
     mx = 0
     for name in os.listdir(out_dir):
         m = re.match(r"checkpoint-(\d+)$", name)
         if m:
             mx = max(mx, int(m.group(1)))
-    return mx
+
+    return mx  # <<< YOU WERE MISSING THIS
+
+
+
+class EMATeacherIgnoreTrainer(Trainer):
+    def __init__(self, *args, ema_decay=0.999, tau_pos=0.97, warmup_steps=500, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ema_decay = float(ema_decay)
+        self.tau_pos = float(tau_pos)
+        self.warmup_steps = int(warmup_steps)
+
+        # teacher = EMA copy of the SAME model (training-time only)
+        self.teacher = copy.deepcopy(self.model).eval()
+        for p in self.teacher.parameters():
+            p.requires_grad = False
+
+        # IMPORTANT: place teacher on same device as student/model
+        # self.model is already placed by Trainer later, but at init time it is usually CPU.
+        # So we will also re-place teacher in _place_model_on_device().
+        self._teacher_on_device = False
+
+    def _place_model_on_device(self):
+        # let Trainer place the student model
+        super()._place_model_on_device()
+
+        # now place teacher on the same device
+        device = next(self.model.parameters()).device
+        self.teacher.to(device)
+        self._teacher_on_device = True
+
+    @torch.no_grad()
+    def _ema_update(self):
+        d = self.ema_decay
+
+        # Ensure teacher is on correct device even if something odd happened
+        if not self._teacher_on_device:
+            device = next(self.model.parameters()).device
+            self.teacher.to(device)
+            self._teacher_on_device = True
+
+        msd = self.model.state_dict()
+        tsd = self.teacher.state_dict()
+
+        for k in tsd.keys():
+            t = tsd[k]
+            m = msd[k]
+
+            # Move student tensor to teacher tensor device if needed
+            if m.device != t.device:
+                m = m.to(t.device)
+
+            if torch.is_floating_point(t):
+                t.mul_(d).add_(m, alpha=1.0 - d)
+            else:
+                t.copy_(m)
+
+    def training_step(self, model, inputs):
+        # update teacher every step (after step 0)
+        if self.state.global_step > 0:
+            self._ema_update()
+        return super().training_step(model, inputs)
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs["labels"]          # (B,H,W) with 0/1/IGNORE
+        pixel_values = inputs["pixel_values"]
+
+        # Only start ignoring after warmup
+        if self.state.global_step >= self.warmup_steps:
+            with torch.no_grad():
+                t_out = self.teacher(pixel_values=pixel_values)
+                t_probs = torch.softmax(t_out.logits, dim=1)[:, 1]  # (B,h,w)
+
+                # upsample to label resolution
+                t_probs = F.interpolate(
+                    t_probs.unsqueeze(1),
+                    size=labels.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                ).squeeze(1)
+
+            suspicious = (labels == 0) & (t_probs > self.tau_pos)
+            if suspicious.any():
+                labels = labels.clone()
+                labels[suspicious] = IGNORE
+                inputs["labels"] = labels
+
+        outputs = model(**inputs)
+        loss = outputs.loss
+        return (loss, outputs) if return_outputs else loss
+
+
+    
+class FillBlackNearest(A.ImageOnlyTransform):
+    def __init__(self, p=1.0):
+        super().__init__(p=p)
+
+    def apply(self, img, **params):
+        return fill_black_nearest(img)
+
+   
+def _nearest_from_mask(img, mask01):
+    """
+    For every pixel, find nearest pixel where mask01==1 and return its RGB.
+    Uses OpenCV DIST_LABEL_PIXEL trick (fast, no scipy).
+    """
+    H, W = mask01.shape
+    old = (mask01 > 0).astype(np.uint8)
+    inv = (old == 0).astype(np.uint8)  # zeros are targets (old==1)
+
+    # distance + labels of nearest zero pixel in inv => nearest old==1 pixel
+    dist, labels = cv2.distanceTransformWithLabels(
+        inv, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
+    )
+
+    lab = labels.astype(np.int64)
+    idx = lab - 1
+    idx = np.clip(idx, 0, H * W - 1)
+    yy = (idx // W).astype(np.int64)
+    xx = (idx % W).astype(np.int64)
+
+    src = img[yy, xx]  # (H,W,3)
+    return dist.astype(np.float32), src.astype(np.float32)
+class BridgeNearbyEndpoints(A.DualTransform):
+    """
+    Connect disjoint GT fragments that are close (like a broken strip).
+    - Uses ONLY positive pixels (mask==1)
+    - Preserves IGNORE pixels (mask==255)
+    - Optionally fills image on newly added GT pixels
+    """
+    def __init__(
+        self,
+        max_gap_px=18,
+        max_bridges=3,
+        line_thickness=(1, 2),
+        min_cc_area=20,
+        fill_image=True,
+        p=0.5
+    ):
+        super().__init__(p=p)
+        self.max_gap_px = int(max_gap_px)
+        self.max_bridges = int(max_bridges)
+        self.line_thickness = tuple(map(int, line_thickness))
+        self.min_cc_area = int(min_cc_area)
+        self.fill_image = bool(fill_image)
+
+    @property
+    def targets_as_params(self):
+        return ["image", "mask"]
+
+    def __call__(self, force_apply=False, **data):
+        if not (force_apply or np.random.rand() < self.p):
+            data["_bridge_ok"] = 0
+            return data
+
+        img = data["image"]
+
+        # --- IMPORTANT: split mask into pos vs ignore ---
+        msk_u8 = data["mask"].astype(np.uint8)          # expected 0/1/255
+        ignore = (msk_u8 == IGNORE)
+        msk = (msk_u8 == 1).astype(np.uint8)            # ONLY positives
+
+        if int(msk.sum()) == 0:
+            data["_bridge_ok"] = 0
+            return data
+
+        H, W = msk.shape
+        old = msk.copy()
+
+        nlabels, labels = cv2.connectedComponents(msk, connectivity=8)
+        if nlabels <= 2:
+            data["_bridge_ok"] = 0
+            return data
+
+        # collect CC masks + endpoints
+        comps = []
+        for lab in range(1, nlabels):
+            cc = (labels == lab).astype(np.uint8)
+            if int(cc.sum()) < self.min_cc_area:
+                continue
+            sk = _morph_skeleton(cc)
+            eps = _endpoints_from_skeleton(sk)  # list[(y,x)]
+            if len(eps) == 0:
+                continue
+            comps.append((lab, cc, eps))
+
+        if len(comps) < 2:
+            data["_bridge_ok"] = 0
+            return data
+
+        # candidate endpoint pairs across different CCs
+        cand = []
+        for i in range(len(comps)):
+            _, _, eps_i = comps[i]
+            for j in range(i + 1, len(comps)):
+                _, _, eps_j = comps[j]
+                for (y1, x1) in eps_i:
+                    for (y2, x2) in eps_j:
+                        d = float(np.hypot(y1 - y2, x1 - x2))
+                        if d <= self.max_gap_px:
+                            cand.append((d, (x1, y1), (x2, y2)))
+
+        if not cand:
+            data["_bridge_ok"] = 0
+            return data
+
+        cand.sort(key=lambda t: t[0])
+
+        out = msk.copy()
+        used = 0
+        for _, p1, p2 in cand:
+            if used >= self.max_bridges:
+                break
+
+            th = int(np.random.randint(self.line_thickness[0], self.line_thickness[1] + 1))
+            tmp = np.zeros((H, W), np.uint8)
+            cv2.line(tmp, p1, p2, color=1, thickness=th, lineType=cv2.LINE_AA)
+
+            before = int(out.sum())
+            out = np.maximum(out, tmp)
+            after = int(out.sum())
+
+            if after > before:
+                used += 1
+
+        if used == 0:
+            data["_bridge_ok"] = 0
+            return data
+
+        # fill image for newly added GT pixels
+        if self.fill_image:
+            img2 = fill_added_pixels_from_old(img, old, out)
+        else:
+            img2 = img
+
+        # restore IGNORE in the final mask
+        out_u8 = out.astype(np.uint8)
+        out_u8[ignore] = IGNORE
+
+        data["image"] = img2
+        data["mask"] = out_u8
+        data["_bridge_ok"] = 1
+        data["_bridges_done"] = used
+        return data
+
+
+class DiffuseGTIntoNeighborhood(A.DualTransform):
+    """
+    Make GT look like it diffuses/spreads (foggy halo) into nearby region.
+    - Image: pulls color from nearest GT pixel and blends outward with a soft alpha.
+    - Mask: expands consistently (dilate or alpha-threshold).
+
+    Works best for stain-like sparse positives.
+    """
+    def __init__(
+        self,
+        radius_range=(6, 30),          # how far diffusion can reach
+        sigma_frac=(0.35, 0.75),       # sigma = frac * radius
+        alpha_power=(0.8, 1.4),        # shape of falloff
+        max_alpha=(0.35, 0.85),        # strength of diffusion
+        mask_mode="dilate",            # "dilate" or "alpha_thresh"
+        mask_thresh=(0.25, 0.45),      # used if mask_mode="alpha_thresh"
+        p=0.5,
+    ):
+        super().__init__(p=p)
+        self.radius_range = radius_range
+        self.sigma_frac = sigma_frac
+        self.alpha_power = alpha_power
+        self.max_alpha = max_alpha
+        self.mask_mode = str(mask_mode)
+        self.mask_thresh = mask_thresh
+
+    @property
+    def targets_as_params(self):
+        return ["image", "mask"]
+
+    def __call__(self, force_apply=False, **data):
+        if not (force_apply or np.random.rand() < self.p):
+            data["_diffuse_ok"] = 0
+            return data
+
+        img = data["image"].copy()
+        # msk = (data["mask"] > 0).astype(np.uint8)
+        msk_u8 = data["mask"].astype(np.uint8)
+        ignore = (msk_u8 == IGNORE)
+        msk = (msk_u8 == 1).astype(np.uint8)
+
+
+        if msk.sum() == 0:
+            data["_diffuse_ok"] = 0
+            return data
+
+        R = int(np.random.randint(self.radius_range[0], self.radius_range[1] + 1))
+        frac = float(np.random.uniform(self.sigma_frac[0], self.sigma_frac[1]))
+        sigma = max(1.0, frac * R)
+        pwr = float(np.random.uniform(self.alpha_power[0], self.alpha_power[1]))
+        amax = float(np.random.uniform(self.max_alpha[0], self.max_alpha[1]))
+
+        dist, src = _nearest_from_mask(img, msk)  # dist to GT, src RGB from nearest GT pixel
+
+        # halo region (outside GT but within R)
+        outside = (msk == 0)
+        halo = outside & (dist <= R)
+        if not halo.any():
+            data["_diffuse_ok"] = 0
+            return data
+
+        # soft alpha falloff
+        d = dist.copy()
+        alpha = np.zeros_like(d, dtype=np.float32)
+        alpha[halo] = np.exp(-(d[halo] ** 2) / (2.0 * (sigma ** 2)))
+        alpha[halo] = np.clip(alpha[halo], 0, 1) ** pwr
+        alpha[halo] *= amax
+
+        alpha3 = alpha[..., None]
+
+        img_f = img.astype(np.float32)
+        # blend only in halo; keep original inside GT
+        img_f = (1.0 - alpha3) * img_f + alpha3 * src
+        img_out = np.clip(img_f, 0, 255).astype(np.uint8)
+
+        # mask expansion
+        if self.mask_mode == "alpha_thresh":
+            t = float(np.random.uniform(self.mask_thresh[0], self.mask_thresh[1]))
+            msk_out = np.maximum(msk, (alpha > t).astype(np.uint8))
+        else:
+            # dist<=R is equivalent to dilation by R in Euclidean sense
+            msk_out = np.maximum(msk, (dist <= R).astype(np.uint8))
+
+        out_u8 = msk_out.astype(np.uint8)
+        out_u8[ignore] = IGNORE
+        data["mask"] = out_u8
+
+        data["image"] = img_out
+        # data["mask"] = msk_out
+        data["_diffuse_ok"] = 1
+        data["_diffuse_R"] = R
+        data["_diffuse_sigma"] = sigma
+        data["_diffuse_amax"] = amax
+        data["_diffuse_mode"] = self.mask_mode
+        return data
+
+    
+import numpy as np
+import cv2
 
 import numpy as np
 import cv2
 import albumentations as A
 
-import numpy as np
-import cv2
-import albumentations as A
+IGNORE = 255
+
+class WhiteTissueDropout(A.DualTransform):
+    """
+    Simulate missing tissue / white voids / white strips seen in histology.
+    - Paints 1..N white blobs or long strips on the IMAGE.
+    - Marks the same pixels as IGNORE in the MASK (so no supervision there).
+    """
+    def __init__(
+        self,
+        n_shapes=(1, 3),
+        mode_probs=(0.6, 0.4),  # (blob, strip)
+        blob_radius=(18, 90),
+        strip_thickness=(18, 80),
+        strip_length_frac=(0.5, 1.3),  # fraction of patch width
+        whiteness=(235, 255),          # white-ish, not pure sometimes
+        blur_ksize=(7, 19),            # soften edges
+        p=0.35
+    ):
+        super().__init__(p=p)
+        self.n_shapes = n_shapes
+        self.mode_probs = mode_probs
+        self.blob_radius = blob_radius
+        self.strip_thickness = strip_thickness
+        self.strip_length_frac = strip_length_frac
+        self.whiteness = whiteness
+        self.blur_ksize = blur_ksize
+
+    @property
+    def targets_as_params(self):
+        return ["image", "mask"]
+
+    def __call__(self, force_apply=False, **data):
+        if not (force_apply or np.random.rand() < self.p):
+            data["_white_dropout_ok"] = 0
+            return data
+
+        img = data["image"].copy()                # uint8 RGB
+        msk = data["mask"].copy().astype(np.uint8)  # 0/1/255
+        H, W = msk.shape
+
+        occ = np.zeros((H, W), np.uint8)
+
+        n = np.random.randint(self.n_shapes[0], self.n_shapes[1] + 1)
+        for _ in range(n):
+            mode = np.random.choice(["blob", "strip"], p=np.array(self.mode_probs)/np.sum(self.mode_probs))
+
+            if mode == "blob":
+                r = np.random.randint(self.blob_radius[0], self.blob_radius[1] + 1)
+                cy = np.random.randint(0, H)
+                cx = np.random.randint(0, W)
+                cv2.circle(occ, (cx, cy), r, 255, thickness=-1)
+
+            else:  # strip
+                th = np.random.randint(self.strip_thickness[0], self.strip_thickness[1] + 1)
+                length = int(np.random.uniform(self.strip_length_frac[0], self.strip_length_frac[1]) * W)
+                length = np.clip(length, 20, int(2.0*W))
+                cx = np.random.randint(0, W)
+                cy = np.random.randint(0, H)
+                angle = np.random.uniform(0, 180)
+
+                # draw a thick line across
+                dx = int(np.cos(np.deg2rad(angle)) * length / 2)
+                dy = int(np.sin(np.deg2rad(angle)) * length / 2)
+                p1 = (int(cx - dx), int(cy - dy))
+                p2 = (int(cx + dx), int(cy + dy))
+                cv2.line(occ, p1, p2, 255, thickness=th, lineType=cv2.LINE_AA)
+
+                # ---- deform the white mask (makes shapes irregular) ----
+        if np.random.rand() < 0.85:  # deformation probability
+
+            alpha = np.random.uniform(120, 420)   # strength
+            sigma = np.random.uniform(6, 14)      # smoothness
+
+            aug = A.ElasticTransform(
+                alpha=alpha,
+                sigma=sigma,
+                interpolation=cv2.INTER_NEAREST,
+                border_mode=cv2.BORDER_CONSTANT,
+                value=0,
+                p=1.0
+            )
+
+            out = aug(image=occ, mask=occ)
+            occ = out["image"]
+
+
+        # soften edges
+        k = int(np.random.randint(self.blur_ksize[0], self.blur_ksize[1] + 1))
+        if k % 2 == 0: k += 1
+        occ_blur = cv2.GaussianBlur(occ, (k, k), 0)
+
+        # threshold to final mask of affected pixels
+        occ01 = (occ_blur > 40).astype(np.uint8)
+
+        # paint white-ish
+        # white = int(np.random.randint(self.whiteness[0], self.whiteness[1] + 1))
+        # pixels you are DROPPING (occlusions you drew)
+        drop = (occ01 == 1)
+
+        # choose one whiteness value for this whole dropout
+        w = int(np.random.randint(self.whiteness[0], self.whiteness[1] + 1))
+
+        # paint dropout pixels white-ish
+        img[drop] = (w, w, w)
+
+        # ignore supervision there
+        msk[drop] = IGNORE
+
+        # ALSO ignore pre-existing "flat white" holes already in the image (optional)
+        flat_white = (img.mean(axis=-1) > 245) & (img.std(axis=-1) < 5)
+        msk[flat_white] = IGNORE
+
+
+        data["image"] = img
+        data["mask"] = msk
+        data["_white_dropout_ok"] = 1
+        data["_white_dropout_px"] = int(occ01.sum())
+        return data
+
 
 def component_bbox(labels, lab, margin, H, W):
     ys, xs = np.where(labels == lab)
@@ -155,26 +709,305 @@ def feather_alpha(h, w, feather=18):
     a = np.clip(d / max(1, feather), 0, 1)
     return a[..., None]  # (H,W,1)
 
+import numpy as np
+import cv2
+import albumentations as A
+
+def _morph_skeleton(binary01: np.ndarray) -> np.ndarray:
+    """
+    Morphological skeletonization (no ximgproc required).
+    Input: binary uint8 {0,1}
+    Output: skeleton uint8 {0,1}
+    """
+    img = (binary01 > 0).astype(np.uint8) * 255
+    skel = np.zeros_like(img, np.uint8)
+    element = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+
+    while True:
+        eroded = cv2.erode(img, element)
+        temp = cv2.dilate(eroded, element)
+        temp = cv2.subtract(img, temp)
+        skel = cv2.bitwise_or(skel, temp)
+        img = eroded.copy()
+        if cv2.countNonZero(img) == 0:
+            break
+
+    return (skel > 0).astype(np.uint8)
+
+def _endpoints_from_skeleton(skel01: np.ndarray) -> np.ndarray:
+    """
+    Endpoints = skeleton pixels with exactly 1 neighbor in 8-connectivity.
+    Returns list of (y,x).
+    """
+    s = (skel01 > 0).astype(np.uint8)
+    # count neighbors via convolution
+    k = np.ones((3,3), np.uint8)
+    neigh = cv2.filter2D(s, -1, k)  # includes self
+    # endpoint: self=1 and neigh==2 (self + 1 neighbor)
+    ep = (s == 1) & (neigh == 2)
+    ys, xs = np.where(ep)
+    return list(zip(ys.tolist(), xs.tolist()))
+
+def _pca_direction(points_yx: np.ndarray) -> np.ndarray:
+    """
+    PCA direction (unit vector) from a set of points (N,2) in (y,x) coords.
+    Returns direction in (dy,dx).
+    """
+    if len(points_yx) < 2:
+        return None
+    pts = points_yx.astype(np.float32)
+    pts_mean = pts.mean(axis=0, keepdims=True)
+    X = pts - pts_mean
+    # covariance
+    C = (X.T @ X) / max(1, (len(pts) - 1))
+    w, v = np.linalg.eigh(C)  # eigenvectors columns
+    d = v[:, np.argmax(w)]    # principal axis in (y,x)
+    norm = np.linalg.norm(d) + 1e-8
+    d = d / norm
+    return d  # (dy,dx)
+
+
+
+class GrowAlongSkeleton(A.DualTransform):
+    """
+    Grow/elongate thin GT structures along their geometry by extending skeleton endpoints.
+
+    - Operates primarily on MASK (binary)
+    - Optionally fills IMAGE in the added region from nearest original GT pixel
+      so supervision stays consistent.
+
+    Parameters:
+      p_choose_cc: chance to apply growth to a given CC
+      min_cc_area: ignore tiny specks
+      endpoint_len_range: how far to extend from endpoints (pixels)
+      thickness_range: thickness of the grown line (pixels)
+      endpoint_count_cap: limit endpoints per CC to avoid crazy changes
+      endpoint_radius: neighborhood radius for PCA direction estimation
+      fill_image: copy texture into newly added pixels for realism
+    """
+    def __init__(
+        self,
+        p_choose_cc=0.5,
+        min_cc_area=25,
+        endpoint_len_range=(6, 20),
+        thickness_range=(1, 3),
+        endpoint_count_cap=4,
+        endpoint_radius=12,
+        fill_image=True,
+        p=0.5
+    ):
+        super().__init__(p=p)
+        self.p_choose_cc = float(p_choose_cc)
+        self.min_cc_area = int(min_cc_area)
+        self.endpoint_len_range = tuple(map(int, endpoint_len_range))
+        self.thickness_range = tuple(map(int, thickness_range))
+        self.endpoint_count_cap = int(endpoint_count_cap)
+        self.endpoint_radius = int(endpoint_radius)
+        self.fill_image = bool(fill_image)
+
+    @property
+    def targets_as_params(self):
+        return ["image", "mask"]
+
+    def __call__(self, force_apply=False, **data):
+        if not (force_apply or np.random.rand() < self.p):
+            data["_grow_ok"] = 0
+            data["_grow_added_px"] = 0
+            return data
+
+        img = data["image"]
+        # msk = (data["mask"] > 0).astype(np.uint8)
+        msk_u8 = data["mask"].astype(np.uint8)
+        ignore = (msk_u8 == IGNORE)
+        msk = (msk_u8 == 1).astype(np.uint8)
+
+        H, W = msk.shape
+
+        nlabels, labels = cv2.connectedComponents(msk, connectivity=8)
+        if nlabels <= 1:
+            data["_grow_ok"] = 0
+            data["_grow_added_px"] = 0
+            return data
+
+        old_msk = msk.copy()
+        out_msk = msk.copy()
+
+        added_total = 0
+        grew_any = False
+
+        for lab in range(1, nlabels):
+            cc = (labels == lab).astype(np.uint8)
+            area = int(cc.sum())
+            if area < self.min_cc_area:
+                continue
+            if np.random.rand() > self.p_choose_cc:
+                continue
+
+            # skeleton + endpoints
+            skel = _morph_skeleton(cc)
+            endpoints = _endpoints_from_skeleton(skel)
+            if len(endpoints) == 0:
+                continue
+
+            # cap endpoints to avoid overgrowth
+            if len(endpoints) > self.endpoint_count_cap:
+                endpoints = [endpoints[i] for i in np.random.choice(len(endpoints), self.endpoint_count_cap, replace=False)]
+
+            # precompute skeleton point list for local PCA
+            sy, sx = np.where(skel > 0)
+            skel_pts = np.stack([sy, sx], axis=1) if len(sy) else None
+
+            for (ey, ex) in endpoints:
+                # local neighborhood points around endpoint
+                if skel_pts is None:
+                    continue
+                dy = skel_pts[:, 0] - ey
+                dx = skel_pts[:, 1] - ex
+                keep = (dy*dy + dx*dx) <= (self.endpoint_radius * self.endpoint_radius)
+                local = skel_pts[keep]
+                dvec = _pca_direction(local)  # (dy,dx)
+                if dvec is None:
+                    continue
+
+                # Make direction point outward: choose sign that goes away from the CC center
+                cy, cx = np.mean(np.where(cc > 0), axis=1)
+                to_ep = np.array([ey - cy, ex - cx], dtype=np.float32)
+                if (to_ep @ dvec) < 0:
+                    dvec = -dvec
+
+                L = np.random.randint(self.endpoint_len_range[0], self.endpoint_len_range[1] + 1)
+                th = np.random.randint(self.thickness_range[0], self.thickness_range[1] + 1)
+
+                y2 = int(round(ey + dvec[0] * L))
+                x2 = int(round(ex + dvec[1] * L))
+                y2 = int(np.clip(y2, 0, H - 1))
+                x2 = int(np.clip(x2, 0, W - 1))
+
+                # draw growth line into a temp mask then OR it in
+                tmp = np.zeros((H, W), np.uint8)
+                cv2.line(tmp, (ex, ey), (x2, y2), color=1, thickness=th, lineType=cv2.LINE_8)
+                before = int(out_msk.sum())
+                out_msk = np.maximum(out_msk, tmp)
+                after = int(out_msk.sum())
+                added = max(0, after - before)
+                if added > 0:
+                    added_total += added
+                    grew_any = True
+
+        if not grew_any:
+            data["_grow_ok"] = 0
+            data["_grow_added_px"] = 0
+            return data
+
+        # Keep supervision consistent: fill image pixels for newly-added GT
+        if self.fill_image:
+            img2 = fill_added_pixels_from_old(img, old_msk, out_msk)
+        else:
+            img2 = img
+
+        data["image"] = img2
+        data["mask"] = out_msk
+        data["_grow_ok"] = 1
+        data["_grow_added_px"] = int(added_total)
+        return data
+
+    
+from sklearn.mixture import GaussianMixture
+
+from sklearn.mixture import GaussianMixture
+import numpy as np
+import cv2
+
+def quick_gmm_sanity_map(
+    img_u8,
+    seed_mask01=None,
+    n_components=5,          # <= 5 is much more stable
+    sample_max=25000,
+    reg_covar=1e-2,          # bump from 1e-3 to 1e-2
+    max_iter=50,
+    random_state=0,
+):
+    H, W = img_u8.shape[:2]
+
+    rgb = img_u8.reshape(-1, 3).astype(np.float64)
+    gray = cv2.cvtColor(img_u8, cv2.COLOR_RGB2GRAY).reshape(-1, 1).astype(np.float64)
+    X = np.concatenate([rgb, gray], axis=1)
+
+    N = X.shape[0]
+    if sample_max is not None and N > sample_max:
+        idx = np.random.choice(N, size=sample_max, replace=False)
+        X_fit = X[idx]
+    else:
+        X_fit = X
+
+    # ---- retry logic: if it collapses, reduce K and/or increase reg ----
+    for K in [n_components, max(2, n_components - 2), 2]:
+        for reg in [reg_covar, reg_covar * 10, reg_covar * 100]:
+            try:
+                gmm = GaussianMixture(
+                    n_components=K,
+                    covariance_type="diag",
+                    reg_covar=reg,
+                    max_iter=max_iter,
+                    n_init=2,
+                    random_state=random_state,
+                )
+                gmm.fit(X_fit)
+                prob = gmm.predict_proba(X)  # (N,K)
+
+                # choose structure component
+                if seed_mask01 is not None and seed_mask01.sum() > 0:
+                    seed = (seed_mask01.reshape(-1) > 0)
+                    comp_score = prob[seed].mean(axis=0)
+                    struct_comp = int(np.argmax(comp_score))
+                else:
+                    means = gmm.means_
+                    struct_comp = int(np.argmin(means[:, -1]))  # darkest in gray
+
+                p_struct = prob[:, struct_comp].reshape(H, W).astype(np.float32)
+
+                p8 = np.clip(p_struct * 255.0, 0, 255).astype(np.uint8)
+                thr, _ = cv2.threshold(p8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                thr_f = float(thr) / 255.0
+                auto = (p_struct >= thr_f).astype(np.uint8)
+
+                return p_struct, auto, thr_f
+
+            except ValueError:
+                pass
+
+    # if everything fails, return zeros (don’t crash your viz)
+    return np.zeros((H, W), np.float32), np.zeros((H, W), np.uint8), 0.0
+
+
 class ComponentScalePaste(A.DualTransform):
     """
-    Extract one connected component (CC), optionally isolate it inside bbox,
-    then RESIZE the patch (bigger/smaller) and paste it at a random location.
+    Extract ONE CC, resize it, and paste it at a random location.
 
-    - image: paste resized CC patch
-    - mask : paste resized CC mask (union)
+    Context-aware paste:
+      - IMAGE paste includes CC + nearby context (alpha defined by context_mode)
+      - MASK paste includes ONLY the CC (labels), NOT the context halo
     """
     def __init__(
         self,
         p_choose=0.7,
         min_cc_area=25,
         margin=8,
-        scale_range=(0.8, 1.8),   # >1 makes bigger
-        max_scale=None,           # optional hard cap based on image size
+        scale_range=(0.8, 1.8),
+        max_scale=None,
+
+        # --- context ---
+        context_radius_px=18,
+        context_mode="dilate",   # "dilate" | "distance" | "rect"
+
+        # --- seam ---
         feather_blend=True,
         feather_width=18,
-        allow_overlap=True,       # allow pasting on top of other CCs
-        require_background=False, # if True, only paste where mask is mostly empty
-        bg_max_pixels=10,         # threshold for "mostly empty"
+
+        # --- destination rules ---
+        allow_overlap=True,
+        require_background=False,
+        bg_max_pixels=10,
         max_tries=80,
         p=0.5
     ):
@@ -184,8 +1017,13 @@ class ComponentScalePaste(A.DualTransform):
         self.margin = int(margin)
         self.scale_range = tuple(map(float, scale_range))
         self.max_scale = float(max_scale) if max_scale is not None else None
+
+        self.context_radius_px = int(context_radius_px)
+        self.context_mode = str(context_mode).lower()
+
         self.feather_blend = bool(feather_blend)
         self.feather_width = int(feather_width)
+
         self.allow_overlap = bool(allow_overlap)
         self.require_background = bool(require_background)
         self.bg_max_pixels = int(bg_max_pixels)
@@ -200,15 +1038,19 @@ class ComponentScalePaste(A.DualTransform):
             return data
 
         img = data["image"]
-        msk = (data["mask"] > 0).astype(np.uint8)
+        # msk = (data["mask"] > 0).astype(np.uint8)
+        msk_u8 = data["mask"].astype(np.uint8)
+        ignore = (msk_u8 == IGNORE)
+        msk = (msk_u8 == 1).astype(np.uint8)
+
         H, W = msk.shape
 
         nlabels, labels = cv2.connectedComponents(msk, connectivity=8)
-        if nlabels <= 1 or np.random.rand() > self.p_choose:
+        if nlabels <= 1 or (np.random.rand() > self.p_choose):
             data["_scale_paste_ok"] = 0
             return data
 
-        # eligible CCs (bias to larger a bit)
+        # eligible CCs
         labs, areas = [], []
         for lab in range(1, nlabels):
             area = int((labels == lab).sum())
@@ -230,33 +1072,51 @@ class ComponentScalePaste(A.DualTransform):
         y0, y1, x0, x1 = bbox
         h0, w0 = (y1 - y0 + 1), (x1 - x0 + 1)
 
-        # isolate the CC inside bbox
+        # isolate CC mask inside bbox
         cc = (labels[y0:y1+1, x0:x1+1] == lab).astype(np.uint8)
-        roi_img = img[y0:y1+1, x0:x1+1].copy()
-        roi_msk = cc
 
-        # choose scale (bigger and bigger)
+        # ROI image includes CC + surrounding pixels (context)
+        roi_img = img[y0:y1+1, x0:x1+1].copy()
+        roi_cc  = cc
+
+        # choose scale
         s = float(np.random.uniform(self.scale_range[0], self.scale_range[1]))
         if self.max_scale is not None:
             s = min(s, self.max_scale)
 
         h1 = max(2, int(round(h0 * s)))
         w1 = max(2, int(round(w0 * s)))
-
-        # cap to image size
         h1 = min(h1, H)
         w1 = min(w1, W)
 
-        # resize image + mask
+        # resize ROI image + CC mask
         roi_img_r = cv2.resize(roi_img, (w1, h1), interpolation=cv2.INTER_LINEAR)
-        roi_msk_r = cv2.resize(roi_msk, (w1, h1), interpolation=cv2.INTER_NEAREST)
-        roi_msk_r = (roi_msk_r > 0).astype(np.uint8)
+        roi_cc_r  = cv2.resize(roi_cc,  (w1, h1), interpolation=cv2.INTER_NEAREST)
+        roi_cc_r  = (roi_cc_r > 0).astype(np.uint8)
 
-        # build "component-only" patch: keep only CC pixels; rest transparent
-        # we'll paste by alpha mask so background shows through
-        alpha = roi_msk_r[..., None].astype(np.float32)
+        # --- alpha for IMAGE paste (CC + context) ---
+        if self.context_mode == "rect":
+            alpha2d = np.ones((h1, w1), np.float32)
 
-        # pick destination anywhere it fits (incl corners)
+        elif self.context_mode == "distance":
+            r = float(max(1, self.context_radius_px))
+            dist = cv2.distanceTransform((1 - roi_cc_r).astype(np.uint8), cv2.DIST_L2, 3)
+            alpha2d = np.clip(1.0 - (dist / r), 0.0, 1.0).astype(np.float32)
+
+        else:
+            k = int(max(1, self.context_radius_px))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*k + 1, 2*k + 1))
+            halo = cv2.dilate(roi_cc_r, kernel, iterations=1).astype(np.float32)
+            alpha2d = halo
+
+        alpha = alpha2d[..., None].astype(np.float32)  # (h1,w1,1)
+
+        # optional feather (softens rectangle boundary)
+        if self.feather_blend:
+            f = feather_alpha(h1, w1, feather=self.feather_width).astype(np.float32)
+            alpha = alpha * f
+
+        # pick destination
         dy0 = dx0 = None
         for _ in range(self.max_tries):
             dy0_try = np.random.randint(0, H - h1 + 1)
@@ -267,7 +1127,6 @@ class ComponentScalePaste(A.DualTransform):
                     continue
 
             if not self.allow_overlap:
-                # disallow overlap with any mask pixels at destination
                 if int(msk[dy0_try:dy0_try+h1, dx0_try:dx0_try+w1].sum()) > 0:
                     continue
 
@@ -283,43 +1142,50 @@ class ComponentScalePaste(A.DualTransform):
         img2 = img.copy()
         msk2 = msk.copy()
 
-        # optional feather on the alpha edge
-        if self.feather_blend:
-            f = feather_alpha(h1, w1, feather=self.feather_width).astype(np.float32)
-            alpha = alpha * f  # soften rectangle boundary (still respects CC mask)
-
+        # paste IMAGE
         base = img2[dy0:dy1+1, dx0:dx1+1].astype(np.float32)
         paste = roi_img_r.astype(np.float32)
-
         img2[dy0:dy1+1, dx0:dx1+1] = np.clip(alpha * paste + (1 - alpha) * base, 0, 255).astype(np.uint8)
 
-        # mask union (pasted CC)
-        msk2[dy0:dy1+1, dx0:dx1+1] = np.maximum(msk2[dy0:dy1+1, dx0:dx1+1], roi_msk_r)
+        # paste MASK (labels only)
+        msk2[dy0:dy1+1, dx0:dx1+1] = np.maximum(msk2[dy0:dy1+1, dx0:dx1+1], roi_cc_r)
 
         data["image"] = img2
         data["mask"] = msk2
         data["_scale_paste_ok"] = 1
         data["_scale_factor"] = s
         data["_paste_box"] = (dy0, dy1, dx0, dx1)
+        data["_context_mode"] = self.context_mode
+        data["_context_radius_px"] = self.context_radius_px
         return data
-
 
 class ComponentSwapPaste(A.DualTransform):
     """
-    Pick ONE connected component, extract its bbox ROI, then SWAP that ROI with a random
-    background patch (same size) anywhere in the image (including corners).
+    Pick ONE CC ROI and move it to a new random location.
+    Source rectangle gets destination background (swap background).
 
-    - Image: swaps pixels (optionally feather blends the pasted component)
-    - Mask : moves the component mask to the new location; source becomes 0
+    Context-aware move:
+      - IMAGE move includes CC + nearby context (alpha defined by context_mode)
+      - MASK move includes ONLY the CC (labels), NOT the context halo
     """
     def __init__(
         self,
         p_choose=0.35,
         min_cc_area=25,
         margin=8,
+
+        # --- context ---
+        context_radius_px=18,
+        context_mode="dilate",   # "dilate" | "distance" | "rect"
+
+        # --- seam ---
         feather_blend=True,
         feather_width=18,
-        allow_overlap=False,     # if False, avoid destination overlapping source bbox
+
+        # --- placement ---
+        allow_overlap=False,
+        require_background=False,
+        bg_max_pixels=10,
         max_tries=50,
         p=0.5
     ):
@@ -327,9 +1193,16 @@ class ComponentSwapPaste(A.DualTransform):
         self.p_choose = float(p_choose)
         self.min_cc_area = int(min_cc_area)
         self.margin = int(margin)
+
+        self.context_radius_px = int(context_radius_px)
+        self.context_mode = str(context_mode).lower()
+
         self.feather_blend = bool(feather_blend)
         self.feather_width = int(feather_width)
+
         self.allow_overlap = bool(allow_overlap)
+        self.require_background = bool(require_background)
+        self.bg_max_pixels = int(bg_max_pixels)
         self.max_tries = int(max_tries)
 
     @property
@@ -341,7 +1214,11 @@ class ComponentSwapPaste(A.DualTransform):
             return data
 
         img = data["image"]
-        msk = (data["mask"] > 0).astype(np.uint8)
+        # msk = (data["mask"] > 0).astype(np.uint8)
+        msk_u8 = data["mask"].astype(np.uint8)   # 0 / 1 / 255
+        ignore = (msk_u8 == IGNORE)              # bool mask for ignore pixels
+        msk = (msk_u8 == 1).astype(np.uint8)     # ONLY positives (foreground)
+
         H, W = msk.shape
 
         nlabels, labels = cv2.connectedComponents(msk, connectivity=8)
@@ -349,20 +1226,17 @@ class ComponentSwapPaste(A.DualTransform):
             data["_swap_ok"] = 0
             return data
 
-        # collect eligible CCs
-        labs = []
-        areas = []
+        labs, areas = [], []
         for lab in range(1, nlabels):
             area = int((labels == lab).sum())
             if area >= self.min_cc_area:
                 labs.append(lab)
                 areas.append(area)
 
-        if not labs or (np.random.rand() > self.p_choose):
+        if (not labs) or (np.random.rand() > self.p_choose):
             data["_swap_ok"] = 0
             return data
 
-        # choose one CC (bias to larger a bit)
         areas = np.asarray(areas, np.float32)
         probs = areas / areas.sum()
         lab = int(np.random.choice(labs, p=probs))
@@ -375,29 +1249,32 @@ class ComponentSwapPaste(A.DualTransform):
         y0, y1, x0, x1 = bbox
         h = y1 - y0 + 1
         w = x1 - x0 + 1
-
-        # if ROI bigger than image (shouldn't happen, but guard)
         if h <= 1 or w <= 1 or h > H or w > W:
             data["_swap_ok"] = 0
             return data
 
-        # pick destination (anywhere incl corners) where ROI fits
         def overlaps(src, dst):
             (sy0, sy1, sx0, sx1) = src
             (dy0, dy1, dx0, dx1) = dst
             return not (dx1 < sx0 or dx0 > sx1 or dy1 < sy0 or dy0 > sy1)
 
         src_box = (y0, y1, x0, x1)
-        dy0 = dx0 = None
 
+        dy0 = dx0 = None
         for _ in range(self.max_tries):
             dy0_try = np.random.randint(0, H - h + 1)
             dx0_try = np.random.randint(0, W - w + 1)
             dst_box = (dy0_try, dy0_try + h - 1, dx0_try, dx0_try + w - 1)
 
-            if self.allow_overlap or (not overlaps(src_box, dst_box)):
-                dy0, dx0 = dy0_try, dx0_try
-                break
+            if (not self.allow_overlap) and overlaps(src_box, dst_box):
+                continue
+
+            if self.require_background:
+                if int(msk[dy0_try:dy0_try+h, dx0_try:dx0_try+w].sum()) > self.bg_max_pixels:
+                    continue
+
+            dy0, dx0 = dy0_try, dx0_try
+            break
 
         if dy0 is None:
             data["_swap_ok"] = 0
@@ -405,90 +1282,352 @@ class ComponentSwapPaste(A.DualTransform):
 
         dy1, dx1 = dy0 + h - 1, dx0 + w - 1
 
-        # --- extract patches ---
         src_img = img[y0:y1+1, x0:x1+1].copy()
-        src_msk = msk[y0:y1+1, x0:x1+1].copy()
-
         dst_img = img[dy0:dy1+1, dx0:dx1+1].copy()
-        dst_msk = msk[dy0:dy1+1, dx0:dx1+1].copy()
 
-        # we only want to move THIS component's mask (not other stuff in bbox)
-        # so isolate that component inside the ROI
+        # CC-only labels in source ROI
         src_cc = (labels[y0:y1+1, x0:x1+1] == lab).astype(np.uint8)
 
-        # build a "component-only" image patch (keep background elsewhere)
-        # (this helps if bbox contains other fibers)
-        comp_img = src_img.copy()
-        comp_img[src_cc == 0] = dst_img[src_cc == 0]  # fill non-CC pixels with destination background
+        # --- alpha for IMAGE move (CC + context) ---
+        if self.context_mode == "rect":
+            alpha2d = np.ones((h, w), np.float32)
 
-        # --- do swap on IMAGE ---
+        elif self.context_mode == "distance":
+            r = float(max(1, self.context_radius_px))
+            dist = cv2.distanceTransform((1 - src_cc).astype(np.uint8), cv2.DIST_L2, 3)
+            alpha2d = np.clip(1.0 - (dist / r), 0.0, 1.0).astype(np.float32)
+
+        else:
+            k = int(max(1, self.context_radius_px))
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*k + 1, 2*k + 1))
+            halo = cv2.dilate(src_cc, kernel, iterations=1).astype(np.float32)
+            alpha2d = halo
+
+        alpha = alpha2d[..., None].astype(np.float32)
+
+        if self.feather_blend:
+            f = feather_alpha(h, w, feather=self.feather_width).astype(np.float32)
+            alpha = alpha * f
+
         img2 = img.copy()
 
-        # put destination background into the source rectangle (pure swap)
+        # 1) source becomes destination background (swap bg)
         img2[y0:y1+1, x0:x1+1] = dst_img
 
-        # put component patch into destination
-        if self.feather_blend:
-            a = feather_alpha(h, w, feather=self.feather_width).astype(np.float32)
-            base = img2[dy0:dy1+1, dx0:dx1+1].astype(np.float32)
-            paste = comp_img.astype(np.float32)
-            img2[dy0:dy1+1, dx0:dx1+1] = np.clip(a * paste + (1 - a) * base, 0, 255).astype(np.uint8)
-        else:
-            img2[dy0:dy1+1, dx0:dx1+1] = comp_img
+        # 2) destination receives source ROI (with alpha)
+        base = img2[dy0:dy1+1, dx0:dx1+1].astype(np.float32)
+        paste = src_img.astype(np.float32)
+        img2[dy0:dy1+1, dx0:dx1+1] = np.clip(alpha * paste + (1 - alpha) * base, 0, 255).astype(np.uint8)
 
-        # --- do swap on MASK ---
+        # MASK move (labels only)
         msk2 = msk.copy()
-
-        # source becomes whatever was at destination (usually background = 0)
-        # BUT: we don't want to drag destination's other CCs into the source,
-        # so safer: zero out the source box
         msk2[y0:y1+1, x0:x1+1] = 0
-
-        # destination: add the moved CC mask
-        # (if you want to overwrite, use '='; if you want union, use max)
         msk2[dy0:dy1+1, dx0:dx1+1] = np.maximum(msk2[dy0:dy1+1, dx0:dx1+1], src_cc)
+        
+        out_u8 = msk2.astype(np.uint8)
+        out_u8[ignore] = IGNORE
+        data["mask"] = out_u8
+
+
 
         data["image"] = img2
-        data["mask"] = msk2
         data["_swap_ok"] = 1
         data["_swap_lab"] = lab
         data["_swap_src_box"] = (y0, y1, x0, x1)
         data["_swap_dst_box"] = (dy0, dy1, dx0, dx1)
+        data["_context_mode"] = self.context_mode
+        data["_context_radius_px"] = self.context_radius_px
         return data
 
-    
-class OffsetCheckpointNamer(TrainerCallback):
-    def __init__(self, output_dir: str, offset: int):
-        self.output_dir = output_dir
-        self.offset = int(offset)
-        self._renamed_steps = set()
+import numpy as np, cv2, albumentations as A
 
-    def on_save(self, args, state, control, **kwargs):
-        step = int(state.global_step)
+def fill_added_pixels_from_old(img_uint8, old_mask01, new_mask01):
+    """
+    For pixels newly added by dilation, copy RGB from nearest old GT pixel.
+    Keeps stain color consistent (brown stays brown).
+    """
+    img2 = img_uint8.copy()
+    old = (old_mask01 > 0).astype(np.uint8)
+    new = (new_mask01 > 0).astype(np.uint8)
+    added = (new == 1) & (old == 0)
+    if not added.any():
+        return img2
 
-        # avoid renaming same step twice
-        if step in self._renamed_steps:
-            return control
+    inv = (old == 0).astype(np.uint8)
+    dist, labels = cv2.distanceTransformWithLabels(inv, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
 
-        src = os.path.join(self.output_dir, f"checkpoint-{step}")
-        if not os.path.isdir(src):
-            return control
+    H, W = old.shape
+    lab = labels.astype(np.int64)
+    idx = lab[added] - 1
+    idx = np.clip(idx, 0, H * W - 1)
+    yy = (idx // W).astype(np.int64)
+    xx = (idx % W).astype(np.int64)
 
-        dst_step = self.offset + step
-        dst = os.path.join(self.output_dir, f"checkpoint-{dst_step}")
-
-        while os.path.exists(dst):
-            dst_step += 1
-            dst = os.path.join(self.output_dir, f"checkpoint-{dst_step}")
-
-        shutil.move(src, dst)
-        self._renamed_steps.add(step)
-
-        print(f"[checkpoint rename] checkpoint-{step} -> checkpoint-{dst_step} (offset={self.offset})")
-        return control
+    ay, ax = np.where(added)
+    img2[ay, ax] = img2[yy, xx]
+    return img2
 
 
-    
+class RandomMaskThickness(A.DualTransform):
+    """
+    Randomly dilate or erode the GT mask to simulate thicker/thinner annotations.
+
+    thickness_px_range: (min,max) radius in pixels
+      - dilation uses +r
+      - erosion uses -r
+
+    p_dilate: probability of choosing dilation (else erosion)
+    """
+    def __init__(self, thickness_px_range=(1, 3), p_dilate=0.5, fill_image_on_dilate=True, p=0.5):
+        super().__init__(p=p)
+        self.thickness_px_range = thickness_px_range
+        self.p_dilate = float(p_dilate)
+        self.fill_image_on_dilate = bool(fill_image_on_dilate)
+
+    @property
+    def targets_as_params(self):
+        return ["image", "mask"]
+
+    def __call__(self, force_apply=False, **data):
+        if not (force_apply or np.random.rand() < self.p):
+            return data
+
+        img = data["image"]
+        msk_u8 = data["mask"].astype(np.uint8)
+        ignore = (msk_u8 == IGNORE)
+        msk = (msk_u8 == 1).astype(np.uint8)
+
+        r = int(np.random.randint(self.thickness_px_range[0], self.thickness_px_range[1] + 1))
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*r + 1, 2*r + 1))
+
+        do_dilate = (np.random.rand() < self.p_dilate)
+        old = msk.copy()
+
+        if do_dilate:
+            new = cv2.dilate(msk, k, iterations=1)
+            if self.fill_image_on_dilate:
+                img2 = fill_added_pixels_from_old(img, old, new)
+            else:
+                img2 = img
+        else:
+            new = cv2.erode(msk, k, iterations=1)
+            img2 = img  # erosion removes label; image doesn't need changes
+
+        out_u8 = new.astype(np.uint8)
+        out_u8[ignore] = IGNORE
+        data["mask"] = out_u8
+
+        data["image"] = img2
+        data["_thickness_r"] = r if do_dilate else -r
+        return data
+
+class MultiCopyPaste(A.DualTransform):
+    """
+    Copy connected components many times with new geometry.
+
+    You control:
+      - how many copies
+      - scaling
+      - elastic deformation
+      - rotation
+      - overlap rules
+    """
+
+    def __init__(
+        self,
+        copies_range=(10, 50),     # <-- set (100,100) for fixed 100
+        min_cc_area=25,
+
+        # geometry
+        scale_range=(0.7, 1.6),
+        rotate_range=(-25, 25),
+
+        elastic_alpha_range=(0, 400),
+        elastic_sigma_range=(0, 6),
+
+        # placement
+        allow_overlap=True,
+        require_background=False,
+        bg_max_pixels=5,
+        max_tries=60,
+
+        feather_blend=True,
+        feather_width=12,
+
+        p=0.5
+    ):
+        super().__init__(p=p)
+
+        self.copies_range = copies_range
+        self.min_cc_area = min_cc_area
+
+        self.scale_range = scale_range
+        self.rotate_range = rotate_range
+
+        self.elastic_alpha_range = elastic_alpha_range
+        self.elastic_sigma_range = elastic_sigma_range
+
+        self.allow_overlap = allow_overlap
+        self.require_background = require_background
+        self.bg_max_pixels = bg_max_pixels
+        self.max_tries = max_tries
+
+        self.feather_blend = feather_blend
+        self.feather_width = feather_width
+
+    @property
+    def targets_as_params(self):
+        return ["image", "mask"]
+
+    def __call__(self, force_apply=False, **data):
+
+        if not (force_apply or np.random.rand() < self.p):
+            data["_copies_done"] = 0
+            return data
+
+        img = data["image"]
+        msk = (data["mask"] > 0).astype(np.uint8)
+
+        H, W = msk.shape
+        img2 = img.copy()
+        msk2 = msk.copy()
+
+        # connected components
+        nlabels, labels = cv2.connectedComponents(msk, connectivity=8)
+
+        # collect eligible CCs
+        ccs = []
+        for lab in range(1, nlabels):
+            cc = (labels == lab).astype(np.uint8)
+            if cc.sum() >= self.min_cc_area:
+                ccs.append(cc)
+
+        if len(ccs) == 0:
+            data["_copies_done"] = 0
+            return data
+
+        # how many copies
+        N = np.random.randint(
+            self.copies_range[0],
+            self.copies_range[1] + 1
+        )
+
+        copies_done = 0
+
+        for _ in range(N):
+
+            cc = random.choice(ccs)
+
+            ys, xs = np.where(cc > 0)
+            y0, y1 = ys.min(), ys.max()
+            x0, x1 = xs.min(), xs.max()
+
+            roi_img = img[y0:y1+1, x0:x1+1].copy()
+            roi_msk = cc[y0:y1+1, x0:x1+1].copy()
+
+            # ---- geometry transform ----
+            scale = np.random.uniform(*self.scale_range)
+            rot   = np.random.uniform(*self.rotate_range)
+
+            h0, w0 = roi_msk.shape
+            h1 = int(h0 * scale)
+            w1 = int(w0 * scale)
+
+            if h1 < 2 or w1 < 2:
+                continue
+            
+            h1 = int(h0 * scale)
+            w1 = int(w0 * scale)
+
+            h1 = min(h1, H - 2)
+            w1 = min(w1, W - 2)
+            if h1 < 2 or w1 < 2:
+                continue
+
+
+            roi_img = cv2.resize(roi_img, (w1, h1))
+            roi_msk = cv2.resize(roi_msk, (w1, h1), interpolation=cv2.INTER_NEAREST)
+
+            # elastic warp
+            alpha = np.random.uniform(*self.elastic_alpha_range)
+            # sigma = np.random.uniform(*self.elastic_sigma_range)
+            sigma = float(np.random.uniform(*self.elastic_sigma_range))
+            sigma = max(1.0, sigma)  # <-- IMPORTANT: Albumentations requires sigma >= 1
+
+            if alpha > 0:
+                aug = A.ElasticTransform(alpha=float(alpha), sigma=float(sigma), p=1.0)
+
+
+            if alpha > 0 and sigma > 0:
+                aug = A.ElasticTransform(
+                    alpha=alpha,
+                    sigma=sigma,
+                    p=1.0
+                )
+                out = aug(image=roi_img, mask=roi_msk)
+                roi_img, roi_msk = out["image"], out["mask"]
+
+            # rotate
+            M = cv2.getRotationMatrix2D((w1//2, h1//2), rot, 1)
+            roi_img = cv2.warpAffine(
+                roi_img, M, (w1, h1),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_REFLECT_101
+            )
+            roi_msk = cv2.warpAffine(
+                roi_msk, M, (w1, h1),
+                flags=cv2.INTER_NEAREST
+            )
+
+            # ---- placement ----
+            placed = False
+            for _ in range(self.max_tries):
+
+                y = np.random.randint(0, H - h1)
+                x = np.random.randint(0, W - w1)
+
+                region = msk2[y:y+h1, x:x+w1]
+
+                if self.require_background:
+                    if region.sum() > self.bg_max_pixels:
+                        continue
+
+                if not self.allow_overlap:
+                    if region.sum() > 0:
+                        continue
+
+                placed = True
+                break
+
+            if not placed:
+                continue
+
+            # ---- paste ----
+            if self.feather_blend:
+                a = feather_alpha(h1, w1, self.feather_width)
+            else:
+                a = roi_msk[..., None]
+
+            base = img2[y:y+h1, x:x+w1].astype(np.float32)
+            paste = roi_img.astype(np.float32)
+
+            img2[y:y+h1, x:x+w1] = (
+                a * paste + (1-a) * base
+            ).astype(np.uint8)
+
+            msk2[y:y+h1, x:x+w1] = np.maximum(
+                msk2[y:y+h1, x:x+w1],
+                roi_msk
+            )
+
+            copies_done += 1
+
+        data["image"] = img2
+        data["mask"]  = msk2
+        data["_copies_done"] = copies_done
+
+        return data
+
 class PatchGaussianNoise(A.DualTransform):
     """
     Adds Gaussian noise to random rectangular patches.
@@ -537,30 +1676,72 @@ class PatchGaussianNoise(A.DualTransform):
     def apply_to_mask(self, mask, **params):
         return mask
 
-def set_dropout(model, hidden=0.2, attn=0.2, classifier=0.3):
-    if hasattr(model.config, "hidden_dropout_prob"):
-        model.config.hidden_dropout_prob = hidden
-    if hasattr(model.config, "attention_probs_dropout_prob"):
-        model.config.attention_probs_dropout_prob = attn
-    if hasattr(model.config, "classifier_dropout_prob"):
-        model.config.classifier_dropout_prob = classifier
-
-    print("Dropout settings:")
-    print("hidden:", getattr(model.config, "hidden_dropout_prob", None))
-    print("attention:", getattr(model.config, "attention_probs_dropout_prob", None))
-    print("classifier:", getattr(model.config, "classifier_dropout_prob", None))
-
 # ---------------- IO HELPERS ----------------
+import os, re
+
 def list_pairs(folder):
-    files = sorted([f for f in os.listdir(folder) if f.lower().endswith((".tif", ".tiff"))])
+    files = [f for f in os.listdir(folder) if f.lower().endswith((".tif", ".tiff"))]
+
     unann, ann = {}, {}
+
     for f in files:
-        m1 = re.match(r"Image\s*(\d+)\s*unannotated\.tif(f)?$", f, flags=re.IGNORECASE)
-        m2 = re.match(r"Image\s*(\d+)_FLAT\.tif(f)?$", f, flags=re.IGNORECASE)
-        if m1: unann[int(m1.group(1))] = os.path.join(folder, f)
-        if m2: ann[int(m2.group(1))] = os.path.join(folder, f)
+        f_stripped = f.strip()
+
+        # --- unannotated ---
+        m1 = re.match(r"^image\s*(\d+)\s*unannotated\.tif(f)?$", f_stripped, flags=re.IGNORECASE)
+        if m1:
+            unann[int(m1.group(1))] = os.path.join(folder, f)
+            continue
+
+        # --- annotated variants ---
+        # 2016 style: "Image 6_FLAT.tif" or "Image 6 _FLAT.tif"
+        m2a = re.match(r"^image\s*(\d+)\s*_?flat\.tif(f)?$", f_stripped, flags=re.IGNORECASE)
+
+        # 2017 style: "IMAGE 13 annotated_FLAT.tif" or "IMAGE 13_annotated_FLAT.tif"
+        m2b = re.match(r"^image\s*(\d+)\s*_?annotated_?flat\.tif(f)?$", f_stripped, flags=re.IGNORECASE)
+
+        if m2a:
+            ann[int(m2a.group(1))] = os.path.join(folder, f)
+            continue
+        if m2b:
+            ann[int(m2b.group(1))] = os.path.join(folder, f)
+            continue
+
     keys = sorted(set(unann.keys()) & set(ann.keys()))
     return [(k, unann[k], ann[k]) for k in keys]
+
+def fill_black_nearest(img):
+    mask = (img.sum(axis=2) == 0).astype(np.uint8)
+
+    if mask.sum() == 0:
+        return img
+
+    inv = (mask == 0).astype(np.uint8)
+    dist, labels = cv2.distanceTransformWithLabels(
+        inv, cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL
+    )
+
+    H, W = mask.shape
+    lab = labels.astype(np.int64)
+
+    yy = (lab // W).clip(0, H-1)
+    xx = (lab %  W).clip(0, W-1)
+
+    img2 = img.copy()
+    img2[mask == 1] = img2[yy[mask == 1], xx[mask == 1]]
+    return img2
+
+def list_pairs_multi(folders):
+    all_pairs = []
+    for fd in folders:
+        if not os.path.isdir(fd):
+            print("WARN: missing folder:", fd)
+            continue
+        pairs = list_pairs(fd)
+        if len(pairs) == 0:
+            print("WARN: no pairs found in:", fd)
+        all_pairs.extend(pairs)
+    return all_pairs
 
 def read_tif_rgb(path):
     img = tiff.imread(path)
@@ -589,12 +1770,64 @@ def green_mask_from_annotated_rgb(ann_rgb):
     m = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
     return (m > 0).astype(np.uint8)
 
-def draw_border(rgb, msk, color=(255, 0, 0), thickness=2):
+import numpy as np
+import cv2
+
+IGNORE = 255
+
+def draw_border(
+    rgb,
+    msk,
+    color=(255, 0, 0),
+    thickness=2,
+    black_thr=8,
+    white_thr=245,
+):
+    """
+    Draw GT border, but DO NOT draw inside:
+      - near-black holes in the IMAGE (e.g., cutout/rotate padding artifacts)
+      - near-white holes/strips in the IMAGE (missing tissue / tears)
+
+    Also ignores IGNORE=255 pixels in the mask.
+
+    Args:
+      rgb: HxWx3 uint8
+      msk: HxW uint8 (0/1 or 0/1/255)
+      color: BGR or RGB? (cv2.drawContours expects BGR if you display with cv2;
+             if you display with matplotlib, treat as RGB. Keep consistent.)
+      thickness: contour thickness
+      black_thr: pixels with all channels < black_thr are treated as holes
+      white_thr: pixels with all channels > white_thr are treated as holes
+    """
     out = rgb.copy()
-    cnts, _ = cv2.findContours((msk > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if len(cnts) > 0:
+
+    # 1) contour source mask (binary), excluding IGNORE
+    m = (msk > 0).astype(np.uint8)
+    if msk.dtype != np.uint8:
+        msk_u8 = msk.astype(np.uint8)
+    else:
+        msk_u8 = msk
+    m[msk_u8 == IGNORE] = 0
+
+    # 2) hole detection from the IMAGE
+    black_holes = (rgb[..., 0] < black_thr) & (rgb[..., 1] < black_thr) & (rgb[..., 2] < black_thr)
+    white_holes = (rgb[..., 0] > white_thr) & (rgb[..., 1] > white_thr) & (rgb[..., 2] > white_thr)
+
+    holes = black_holes | white_holes
+
+    # 3) remove hole pixels from contour source so we don’t draw there
+    m[holes] = 0
+
+    # optional: reduce speck contours (tiny islands)
+    # m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), iterations=1)
+
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
         cv2.drawContours(out, cnts, -1, color, thickness)
+
     return out
+
+
 
 def cc_count(binary_mask):
     nlabels, _ = cv2.connectedComponents((binary_mask > 0).astype(np.uint8), connectivity=8)
@@ -617,6 +1850,214 @@ def component_bbox(labels, lab, margin, H, W):
     y0 = max(0, y0 - margin); x0 = max(0, x0 - margin)
     y1 = min(H-1, y1 + margin); x1 = min(W-1, x1 + margin)
     return (y0, y1, x0, x1)
+
+from sklearn.mixture import GaussianMixture
+
+from sklearn.mixture import GaussianMixture
+import numpy as np
+import cv2
+import albumentations as A
+
+IGNORE = 255
+
+class GMMPromoteWholeTissue(A.DualTransform):
+    """
+    If GT dots sit on a coherent tissue/stain region, promote the *entire connected region*
+    (under a posterior threshold) to GT.
+
+    - Fit K-comp GMM in ROI around GT
+    - Select structure component by GT posterior
+    - Threshold p_struct -> candidate tissue mask
+    - Keep only candidate CCs that intersect GT (or GT dilated)
+    - Promote those CCs to GT
+    - Optionally: mark low-confidence band as IGNORE
+    """
+    def __init__(
+        self,
+        margin=24,
+        min_cc_area=25,
+        max_rois=4,
+        roi_max_size=256,
+
+        n_components=5,            # <<< IMPORTANT (your observation)
+        cov_type="diag",
+        reg_covar=1e-4,
+        max_iter=120,
+        n_init=2,
+
+        # tissue thresholding
+        seed_prob=0.85,            # candidate tissue pixels (lower = more inclusive)
+        ignore_prob=0.70,          # optional ignore band lower bound
+        use_ignore_band=True,
+
+        # limit explosion
+        intersect_dilate=7,        # CC must intersect GT dilated by this
+        max_promote_px=8000,       # safety cap per ROI
+
+        connect_close=True,
+        close_kernel=3,
+
+        p=0.35
+    ):
+        super().__init__(p=p)
+        self.margin = int(margin)
+        self.min_cc_area = int(min_cc_area)
+        self.max_rois = int(max_rois)
+        self.roi_max_size = int(roi_max_size)
+
+        self.n_components = int(n_components)
+        self.cov_type = cov_type
+        self.reg_covar = float(reg_covar)
+        self.max_iter = int(max_iter)
+        self.n_init = int(n_init)
+
+        self.seed_prob = float(seed_prob)
+        self.ignore_prob = float(ignore_prob)
+        self.use_ignore_band = bool(use_ignore_band)
+
+        self.intersect_dilate = int(intersect_dilate)
+        self.max_promote_px = int(max_promote_px)
+
+        self.connect_close = bool(connect_close)
+        self.close_kernel = int(close_kernel)
+
+    @property
+    def targets_as_params(self):
+        return ["image", "mask"]
+
+    def __call__(self, force_apply=False, **data):
+        if not (force_apply or np.random.rand() < self.p):
+            data["_gmm_promote_ok"] = 0
+            return data
+
+        img = data["image"]                          # uint8 RGB
+        msk = data["mask"].copy().astype(np.uint8)   # 0/1/255 possible
+        H, W = msk.shape
+
+        pos = (msk == 1).astype(np.uint8)
+        if pos.sum() == 0:
+            data["_gmm_promote_ok"] = 0
+            return data
+
+        nlabels, labels = cv2.connectedComponents(pos, connectivity=8)
+
+        rois = []
+        for lab in range(1, nlabels):
+            cc = (labels == lab).astype(np.uint8)
+            area = int(cc.sum())
+            if area < self.min_cc_area:
+                continue
+            ys, xs = np.where(cc > 0)
+            y0, y1 = ys.min(), ys.max()
+            x0, x1 = xs.min(), xs.max()
+            y0 = max(0, y0 - self.margin); x0 = max(0, x0 - self.margin)
+            y1 = min(H - 1, y1 + self.margin); x1 = min(W - 1, x1 + self.margin)
+
+            if (y1 - y0 + 1) > self.roi_max_size or (x1 - x0 + 1) > self.roi_max_size:
+                cy = (y0 + y1) // 2
+                cx = (x0 + x1) // 2
+                half = self.roi_max_size // 2
+                y0 = max(0, cy - half); y1 = min(H - 1, cy + half)
+                x0 = max(0, cx - half); x1 = min(W - 1, cx + half)
+
+            rois.append((area, y0, y1, x0, x1))
+
+        if not rois:
+            data["_gmm_promote_ok"] = 0
+            return data
+
+        rois.sort(reverse=True, key=lambda t: t[0])
+        rois = rois[: self.max_rois]
+
+        added_total, ignored_total = 0, 0
+
+        for _, y0, y1, x0, x1 in rois:
+            roi_img = img[y0:y1+1, x0:x1+1]
+            roi_pos = pos[y0:y1+1, x0:x1+1]
+
+            if roi_pos.sum() < self.min_cc_area:
+                continue
+
+            # features: RGB + gray
+            rgb = roi_img.reshape(-1, 3).astype(np.float32)
+            gray = cv2.cvtColor(roi_img, cv2.COLOR_RGB2GRAY).reshape(-1, 1).astype(np.float32)
+            X = np.concatenate([rgb, gray], axis=1).astype(np.float64)
+
+            gmm = GaussianMixture(
+                n_components=self.n_components,
+                covariance_type=self.cov_type,
+                reg_covar=self.reg_covar,
+                max_iter=self.max_iter,
+                n_init=self.n_init,
+                random_state=None
+            )
+            gmm.fit(X)
+
+            prob = gmm.predict_proba(X)  # (N,K)
+
+            roi_pos_flat = roi_pos.reshape(-1) > 0
+            if roi_pos_flat.sum() == 0:
+                continue
+
+            # choose structure component by GT posterior
+            comp_score = prob[roi_pos_flat].mean(axis=0)
+            k_struct = int(np.argmax(comp_score))
+            p_struct = prob[:, k_struct].reshape(roi_pos.shape)
+
+            # candidate tissue region
+            cand = (p_struct >= self.seed_prob).astype(np.uint8)
+
+            if self.connect_close and cand.sum() > 0:
+                k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (self.close_kernel, self.close_kernel))
+                cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, k, iterations=1)
+
+            if cand.sum() == 0:
+                continue
+
+            # Only keep CCs of cand that intersect GT (dilated)
+            if self.intersect_dilate > 0:
+                kd = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (2*self.intersect_dilate + 1, 2*self.intersect_dilate + 1)
+                )
+                pos_d = cv2.dilate(roi_pos, kd, iterations=1)
+            else:
+                pos_d = roi_pos
+
+            n2, lab2 = cv2.connectedComponents(cand, connectivity=8)
+            keep = np.zeros_like(cand, dtype=np.uint8)
+            for c in range(1, n2):
+                cc = (lab2 == c).astype(np.uint8)
+                if (cc & pos_d).any():
+                    keep = np.maximum(keep, cc)
+
+            if keep.sum() == 0:
+                continue
+
+            # safety cap
+            if int(keep.sum()) > self.max_promote_px:
+                # if too big, don’t promote (prevents runaway)
+                continue
+
+            # promote to GT, but don't overwrite IGNORE
+            roi_msk = msk[y0:y1+1, x0:x1+1]
+            add = (keep == 1) & (roi_msk == 0)
+            if add.any():
+                roi_msk[add] = 1
+                added_total += int(add.sum())
+
+            if self.use_ignore_band:
+                ign = (p_struct >= self.ignore_prob) & (p_struct < self.seed_prob) & (roi_msk == 0)
+                if ign.any():
+                    roi_msk[ign] = IGNORE
+                    ignored_total += int(ign.sum())
+
+            msk[y0:y1+1, x0:x1+1] = roi_msk
+
+        data["mask"] = msk
+        data["_gmm_promote_ok"] = 1
+        data["_gmm_promote_added_px"] = int(added_total)
+        data["_gmm_promote_ignored_px"] = int(ignored_total)
+        return data
 
 def sample_components(labels, min_area=25, p_choose=0.35, prefer_elongated=True, max_pick=None):
     """
@@ -662,6 +2103,41 @@ def sample_components(labels, min_area=25, p_choose=0.35, prefer_elongated=True,
 
     return chosen
 
+class FillBlackNearest(A.ImageOnlyTransform):
+    def __init__(self, p=1.0):
+        super().__init__(p=p)
+
+    def apply(self, img, **params):
+        return fill_black_nearest(img)
+
+   
+def fill_black_nearest(img):
+
+    mask = (img.sum(axis=2) == 0).astype(np.uint8)
+    if mask.sum() == 0:
+        return img
+
+    inv = (mask == 0).astype(np.uint8)
+
+    dist, labels = cv2.distanceTransformWithLabels(
+        inv,
+        cv2.DIST_L2,
+        3,
+        labelType=cv2.DIST_LABEL_PIXEL
+    )
+
+    H, W = mask.shape
+    lab = labels.astype(np.int64)
+
+    yy = (lab // W).clip(0, H-1)
+    xx = (lab %  W).clip(0, W-1)
+
+    img2 = img.copy()
+    img2[mask == 1] = img2[yy[mask == 1], xx[mask == 1]]
+
+    return img2
+
+
 # ---------------- Per-Component ROI Warp Transform ----------------
 class ProbabilisticComponentWarp(A.DualTransform):
     """
@@ -693,8 +2169,8 @@ class ProbabilisticComponentWarp(A.DualTransform):
         self.max_pick = int(max_pick) if max_pick is not None else None
 
         # Randomize elastic strength PER CALL (so every augmentation is different)
-        self.elastic_alpha_range = (200.0, float(elastic_alpha))
-        self.elastic_sigma_range = (3.0, float(elastic_sigma))
+        self.elastic_alpha_range = (40.0, float(elastic_alpha))
+        self.elastic_sigma_range = (1.0, float(elastic_sigma))
         self.alpha_affine = float(alpha_affine)
 
     @property
@@ -710,7 +2186,12 @@ class ProbabilisticComponentWarp(A.DualTransform):
         sigma = float(np.random.uniform(*self.elastic_sigma_range))
 
         img = data["image"]
-        mask = (data["mask"] > 0).astype(np.uint8)
+        # mask = (data["mask"] > 0).astype(np.uint8)
+        msk_u8 = data["mask"].astype(np.uint8)
+        ignore = (msk_u8 == IGNORE)
+        mask = (msk_u8 == 1).astype(np.uint8)
+
+        
         H, W = mask.shape
 
         nlabels, labels = cv2.connectedComponents(mask, connectivity=8)
@@ -773,8 +2254,11 @@ class ProbabilisticComponentWarp(A.DualTransform):
 
             mask2[y0:y1+1, x0:x1+1] = msk_w
 
+        out_u8 = mask2.astype(np.uint8)
+        out_u8[ignore] = IGNORE
+        data["mask"] = out_u8
+
         data["image"] = img2
-        data["mask"]  = mask2
         data["_chosen_cc_count"] = len(chosen_labs)
         data["_elastic_alpha"] = alpha
         data["_elastic_sigma"] = sigma
@@ -906,76 +2390,152 @@ def main():
     rgb_shift_aug = A.RGBShift(r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, p=0.5)
 
 
+    # ---------------- TRAIN AUG ----------------
     train_aug = A.Compose([
-        # Geometry (safe)
+            # ---- SAFE GLOBAL GEOMETRY ----
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.2),
         A.RandomRotate90(p=0.3),
-        A.RGBShift(r_shift_limit=18, g_shift_limit=12, b_shift_limit=18, p=0.6),
+
         A.Affine(
-            translate_percent={"x": (-0.1, 0.1), "y": (-0.1, 0.1)},
-            scale=(0.50, 1.50),
-            rotate=(-40, 40),
+            translate_percent={"x": (-0.08, 0.08), "y": (-0.08, 0.08)},
+            scale=(0.95, 1.05),
+            rotate=(-25, 25),
             interpolation=cv2.INTER_LINEAR,
             mask_interpolation=cv2.INTER_NEAREST,
             mode=cv2.BORDER_REFLECT_101,
+            p=0.45
+        ),
+
+        # ---- CONSERVATIVE LABEL FIX (DO THIS EARLY, BEFORE SHAPE-MUTATING AUGS) ----
+        # Key changes vs your current:
+        # - ignores tiny dots (min_cc_area up)
+        # - only grows within 5px neighborhood
+        # - adds only very high confidence pixels
+        # - does NOT do morphological close by default (blob-maker)
+        GMMPromoteWholeTissue(
+            margin=24,
+            min_cc_area=25,
+            max_rois=4,
+            roi_max_size=256,
+            n_components=5,      # <<< do what you observed
+            seed_prob=0.85,      # 0.80–0.90 good start
+            ignore_prob=0.70,
+            intersect_dilate=7,
+            max_promote_px=8000, # safety
+            connect_close=True,
+            close_kernel=3,
             p=0.5
         ),
 
+        # ---- COLOR / ACQUISITION REALISM (IMAGE-ONLY or mild) ----
+        A.RGBShift(r_shift_limit=14, g_shift_limit=10, b_shift_limit=14, p=0.5),
 
-        # Acquisition realism (one-of)
         A.OneOf([
-            A.RandomBrightnessContrast(0.10, 0.10),
-            A.ColorJitter(brightness=0.08, contrast=0.08, saturation=0.06, hue=0.02),
+            A.RandomBrightnessContrast(0.08, 0.08),
+            A.ColorJitter(brightness=0.06, contrast=0.06, saturation=0.05, hue=0.02),
             A.GaussianBlur(blur_limit=(3, 5)),
             A.MotionBlur(blur_limit=3),
-            A.ISONoise(color_shift=(0.01, 0.2), intensity=(0.1, 0.35)),
-            A.ImageCompression(quality_lower=60, quality_upper=95),
-        ], p=0.6),
+            A.ISONoise(color_shift=(0.01, 0.15), intensity=(0.08, 0.25)),
+            A.ImageCompression(quality_lower=65, quality_upper=95),
+        ], p=0.55),
 
-        ComponentSwapPaste(
-            p_choose=0.4,        # chance to attempt choosing a CC
-            min_cc_area=MIN_CC_AREA,
-            margin=ROI_MARGIN,
+        # ---- DIFFUSION LOOK: STRONGER IN IMAGE, WEAK IN MASK ----
+        # Switch to alpha_thresh + smaller radius + weaker max_alpha
+        # so you get “spread” visually without turning dots into disks.
+        DiffuseGTIntoNeighborhood(
+            radius_range=(6, 14),        # smaller than (8,28)
+            sigma_frac=(0.45, 0.75),
+            alpha_power=(1.0, 1.6),      # steeper falloff -> less mask growth
+            max_alpha=(0.20, 0.45),      # weaker blend
+            mask_mode="alpha_thresh",
+            mask_thresh=(0.65, 0.85),    # HIGH threshold = minimal mask expansion
+            p=0.55
+        ),
+
+        # ---- OPTIONAL: CONNECT BROKEN LINES (MASK + IMAGE fill), BUT KEEP IT TIGHT ----
+        BridgeNearbyEndpoints(
+            max_gap_px=10,              # was 30 -> too aggressive
+            max_bridges=2,
+            line_thickness=(1, 1),      # keep thin
+            fill_image=True,
+            p=0.5
+        ),
+
+        # ---- SHAPE-MUTATING AUGS: KEEP MILD + LESS FREQUENT ----
+        MultiCopyPaste(
+            copies_range=(0, 2),        # was (0,5)
+            scale_range=(0.90, 1.10),   # keep close to original
+            rotate_range=(-20, 20),
+            elastic_alpha_range=(0, 250),
+            elastic_sigma_range=(0, 6),
+            allow_overlap=True,
             feather_blend=True,
-            feather_width=18,
-            allow_overlap=False,
-            p=0.9
+            feather_width=10,
+            p=0.25
+        ),
+
+        GrowAlongSkeleton(
+            p_choose_cc=0.45,
+            min_cc_area=80,             # prevents dot growth
+            endpoint_len_range=(1, 10), # shorter
+            thickness_range=(1, 5),     # thinner
+            endpoint_count_cap=2,
+            endpoint_radius=12,
+            fill_image=True,
+            p=0.30
         ),
 
         ComponentScalePaste(
-            p_choose=0.8,
-            min_cc_area=MIN_CC_AREA,
+            p_choose=0.6,
+            min_cc_area=80,             # avoid scaling tiny specks
             margin=ROI_MARGIN,
-            scale_range=(1.0, 2.5),     # bigger and bigger
+            scale_range=(0.95, 1.3),
+            context_mode="distance",
+            context_radius_px=18,       # was 50
             feather_blend=True,
-            feather_width=18,
-            require_background=False,   # set True if you want only empty areas
-            p=0.6
+            feather_width=12,
+            p=0.25
         ),
 
-        PatchGaussianNoise(
-            num_patches_range=(1, 3),
-            patch_size_range=(48, 160),
-            noise_std_range=(8, 30),
-            p=0.4
+        ComponentSwapPaste(
+            p_choose=0.25,
+            min_cc_area=80,
+            margin=ROI_MARGIN,
+            context_mode="distance",
+            context_radius_px=14,
+            feather_blend=True,
+            feather_width=12,
+            allow_overlap=False,
+            p=0.20
         ),
 
-        # Your local per-CC warp (keep, but not insane)
+        # ---- LOCAL CC WARP: KEEP MILD + RARE ----
         ProbabilisticComponentWarp(
-            p_choose=0.25,          # consider lowering from 0.35
-            min_cc_area=MIN_CC_AREA,
+            p_choose=0.18,
+            min_cc_area=80,            # avoid tiny CCs
             prefer_elongated=True,
             margin=ROI_MARGIN,
             pad=PAD,
-            elastic_alpha=600,
-            elastic_sigma=8,
+            elastic_alpha=180,         # lower than your 250
+            elastic_sigma=3,           # slightly lower
             alpha_affine=0,
             feather_blend=True,
-            feather_width=18,
-            max_pick=6,
-            p=0.8,                  # not always
+            feather_width=14,
+            max_pick=4,
+            p=0.25
         ),
+
+        # ---- PATCH NOISE (IMAGE ONLY) ----
+        PatchGaussianNoise(
+            num_patches_range=(1, 2),
+            patch_size_range=(48, 140),
+            noise_std_range=(6, 22),
+            p=0.35
+        ),
+
+        # ---- FIX BLACK HOLES (AFTER ANY WARP/ROTATE) ----
+        FillBlackNearest(p=0.5),
     ])
 
 
@@ -1067,13 +2627,25 @@ def main():
             
     )
 
-    trainer = Trainer(
+    trainer = EMATeacherIgnoreTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         compute_metrics=compute_metrics,
+        ema_decay=0.999,
+        tau_pos=0.97,
+        warmup_steps=500
     )
+    # trainer = Trainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_ds,
+    #     eval_dataset=eval_ds,
+    #     compute_metrics=compute_metrics,
+    # )
+
+
 
     import re
     
@@ -1119,6 +2691,9 @@ def main():
     trainer.add_callback(lr_cb)
     lr_cb.trainer = trainer
 
+
+
+        
     if ckpt:
         print("Loading WEIGHTS ONLY from:", ckpt)
         model = SegformerForSemanticSegmentation.from_pretrained(
