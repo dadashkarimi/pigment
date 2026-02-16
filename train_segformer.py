@@ -1324,8 +1324,15 @@ class ComponentSwapPaste(A.DualTransform):
         msk2[y0:y1+1, x0:x1+1] = 0
         msk2[dy0:dy1+1, dx0:dx1+1] = np.maximum(msk2[dy0:dy1+1, dx0:dx1+1], src_cc)
         
+        # MASK move (labels only), keep IGNORE untouched
+        msk2 = (msk_u8 == 1).astype(np.uint8)      # start from positives only
+        msk2[y0:y1+1, x0:x1+1] = 0                 # remove source CC
+        msk2[dy0:dy1+1, dx0:dx1+1] = np.maximum(
+            msk2[dy0:dy1+1, dx0:dx1+1], src_cc
+        )
+
         out_u8 = msk2.astype(np.uint8)
-        out_u8[ignore] = IGNORE
+        out_u8[ignore] = IGNORE                    # restore ignore pixels
         data["mask"] = out_u8
 
 
@@ -1421,6 +1428,7 @@ class RandomMaskThickness(A.DualTransform):
         data["_thickness_r"] = r if do_dilate else -r
         return data
 
+
 class MultiCopyPaste(A.DualTransform):
     """
     Copy connected components many times with new geometry.
@@ -1487,6 +1495,11 @@ class MultiCopyPaste(A.DualTransform):
 
         img = data["image"]
         msk = (data["mask"] > 0).astype(np.uint8)
+        msk_u8 = data["mask"].astype(np.uint8)
+        ignore = (msk_u8 == IGNORE)
+        msk = (msk_u8 == 1).astype(np.uint8)   # ONLY positives
+
+
 
         H, W = msk.shape
         img2 = img.copy()
@@ -1622,8 +1635,13 @@ class MultiCopyPaste(A.DualTransform):
 
             copies_done += 1
 
+            # at end:
+        out_u8 = msk2.astype(np.uint8)
+        out_u8[ignore] = IGNORE
+        data["mask"] = out_u8
+
         data["image"] = img2
-        data["mask"]  = msk2
+        # data["mask"]  = msk2
         data["_copies_done"] = copies_done
 
         return data

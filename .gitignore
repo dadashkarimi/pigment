@@ -1,0 +1,17 @@
+
+# caches / junk
+.hf_cache/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# outputs / logs
+*.out
+*.err
+wandb/
+runs/
+logs/
+
+# ignore all checkpoints (we will add latest with -f)
+segformer-rerun-equal-epochs/**/checkpoint-*/
+**/checkpoint-*/
