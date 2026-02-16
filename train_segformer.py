@@ -2725,6 +2725,12 @@ def main():
     else:
         print("No checkpoint found. Starting from base model:", args.model_id)
 
+    trainer.teacher = copy.deepcopy(trainer.model).eval()
+    for p in trainer.teacher.parameters():
+        p.requires_grad_(False)
+    trainer.teacher.to(next(trainer.model.parameters()).device)
+
+
     trainer.train(resume_from_checkpoint=False)  # fresh LR/optimizer
 
 
