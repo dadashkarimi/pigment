@@ -2744,7 +2744,7 @@ def main():
             copies_range=(0, 2),        # was (0,5)
             scale_range=(0.90, 1.10),   # keep close to original
             rotate_range=(-10, 10),
-            elastic_alpha_range=(0, 250),
+            elastic_alpha_range=(0, 550),
             elastic_sigma_range=(0, 6),
             allow_overlap=True,
             feather_blend=True,
@@ -2754,9 +2754,9 @@ def main():
 
         GrowAlongSkeleton(
             p_choose_cc=0.45,
-            min_cc_area=120,
-            endpoint_len_range=(1, 50),
-            thickness_range=(1, 6),
+            min_cc_area=60,
+            endpoint_len_range=(1, 150),
+            thickness_range=(1, 3),
             endpoint_count_cap=2,
             endpoint_radius=12,
             fill_mode="directional",   # or "brown_nearest" or "none"
@@ -2770,7 +2770,7 @@ def main():
             p_choose=0.6,
             min_cc_area=120,             # avoid scaling tiny specks
             margin=ROI_MARGIN,
-            scale_range=(0.95, 2.3),
+            scale_range=(0.95, 1.3),
             context_mode="distance",
             context_radius_px=18,       # was 50
             feather_blend=True,
@@ -2779,9 +2779,9 @@ def main():
         ),
 
         MaskedRGBShift(
-            r_shift_limit=(5, 5),
-            g_shift_limit=(-5, 5),
-            b_shift_limit=(-5, 5),
+            r_shift_limit=(20, 35),
+            g_shift_limit=(-20, 15),
+            b_shift_limit=(-25, 5),
             feather_px=6,
             p=0.5
         ),
@@ -2796,7 +2796,7 @@ def main():
 
         ComponentSwapPaste(
             p_choose=0.25,
-            min_cc_area=80,
+            min_cc_area=10,
             margin=ROI_MARGIN,
             context_mode="distance",
             context_radius_px=14,
