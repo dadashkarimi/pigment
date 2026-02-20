@@ -76,6 +76,34 @@ if SEED is not None:
     random.seed(SEED)
     np.random.seed(SEED)
 
+import torch.nn.functional as F
+
+# ---------------- Diffusion-like forward noise (for Option A) ----------------
+# Simple DDPM-style forward process: x_t = sqrt(a_bar)*x0 + sqrt(1-a_bar)*eps
+_DIFF_T = 1000
+_BETA_START = 1e-4
+_BETA_END = 2e-2
+
+_betas = np.linspace(_BETA_START, _BETA_END, _DIFF_T, dtype=np.float64)
+_alphas = 1.0 - _betas
+_alpha_bars = np.cumprod(_alphas, axis=0).astype(np.float64)  # shape (T,)
+
+def diffusion_forward_u8(img_u8: np.ndarray, t: int = None) -> np.ndarray:
+    """
+    img_u8: HxWx3 uint8 RGB
+    returns: HxWx3 uint8 RGB, forward-diffused (noised) version
+    """
+    if t is None:
+        t = np.random.randint(0, _DIFF_T)
+
+    a_bar = float(_alpha_bars[t])
+    # Convert to float [0,1]
+    x0 = img_u8.astype(np.float32) / 255.0
+    eps = np.random.randn(*x0.shape).astype(np.float32)
+
+    xt = (np.sqrt(a_bar) * x0) + (np.sqrt(1.0 - a_bar) * eps)
+    xt = np.clip(xt, 0.0, 1.0)
+    return (xt * 255.0).astype(np.uint8)
 
     
 import re, os, shutil
@@ -539,16 +567,17 @@ class EMATeacherIgnoreTrainer(Trainer):
         return super().training_step(model, inputs)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs["labels"]          # (B,H,W) with 0/1/IGNORE
+        # --- grab and REMOVE pixel_values_2 so model(**inputs) won't see it ---
+        pixel_values_2 = inputs.pop("pixel_values_2", None)   # <<< NEW (critical)
+
+        labels = inputs["labels"]
         pixel_values = inputs["pixel_values"]
 
-        # Only start ignoring after warmup
+        # -------- your EMA teacher ignore logic (unchanged) --------
         if self.state.global_step >= self.warmup_steps:
             with torch.no_grad():
                 t_out = self.teacher(pixel_values=pixel_values)
-                t_probs = torch.softmax(t_out.logits, dim=1)[:, 1]  # (B,h,w)
-
-                # upsample to label resolution
+                t_probs = torch.softmax(t_out.logits, dim=1)[:, 1]
                 t_probs = F.interpolate(
                     t_probs.unsqueeze(1),
                     size=labels.shape[-2:],
@@ -562,10 +591,39 @@ class EMATeacherIgnoreTrainer(Trainer):
                 labels[suspicious] = IGNORE
                 inputs["labels"] = labels
 
+        # -------- supervised forward (now safe) --------
         outputs = model(**inputs)
-        loss = outputs.loss
-        return (loss, outputs) if return_outputs else loss
+        sup_loss = outputs.loss
 
+        # -------- Option A: consistency (second view) --------
+        cons_loss = None
+        if pixel_values_2 is not None:
+            out2 = model(pixel_values=pixel_values_2)
+
+            logits1 = outputs.logits
+            logits2 = out2.logits
+
+            logits1_u = F.interpolate(logits1, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+            logits2_u = F.interpolate(logits2, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+
+            valid = (labels != IGNORE)
+
+            T = 1.0
+            p1 = torch.softmax(logits1_u / T, dim=1)
+            p2 = torch.softmax(logits2_u / T, dim=1)
+            logp1 = torch.log_softmax(logits1_u / T, dim=1)
+            logp2 = torch.log_softmax(logits2_u / T, dim=1)
+
+            kl12 = (p1 * (logp1 - logp2)).sum(dim=1)
+            kl21 = (p2 * (logp2 - logp1)).sum(dim=1)
+            kl = 0.5 * (kl12 + kl21)
+
+            denom = valid.float().sum().clamp_min(1.0)
+            cons_loss = (kl * valid.float()).sum() / denom
+
+        lam = 0.2
+        loss = sup_loss if cons_loss is None else (sup_loss + lam * cons_loss)
+        return (loss, outputs) if return_outputs else loss
 
     
 class FillBlackNearest(A.ImageOnlyTransform):
@@ -2744,7 +2802,7 @@ def main():
             copies_range=(0, 2),        # was (0,5)
             scale_range=(0.90, 1.10),   # keep close to original
             rotate_range=(-10, 10),
-            elastic_alpha_range=(0, 550),
+            elastic_alpha_range=(0, 450),
             elastic_sigma_range=(0, 6),
             allow_overlap=True,
             feather_blend=True,
@@ -2754,9 +2812,9 @@ def main():
 
         GrowAlongSkeleton(
             p_choose_cc=0.45,
-            min_cc_area=60,
-            endpoint_len_range=(1, 150),
-            thickness_range=(1, 3),
+            min_cc_area=120,
+            endpoint_len_range=(1, 20),
+            thickness_range=(1, 4),
             endpoint_count_cap=2,
             endpoint_radius=12,
             fill_mode="directional",   # or "brown_nearest" or "none"
@@ -2770,7 +2828,7 @@ def main():
             p_choose=0.6,
             min_cc_area=120,             # avoid scaling tiny specks
             margin=ROI_MARGIN,
-            scale_range=(0.95, 1.3),
+            scale_range=(0.95, 2.3),
             context_mode="distance",
             context_radius_px=18,       # was 50
             feather_blend=True,
@@ -2779,9 +2837,9 @@ def main():
         ),
 
         MaskedRGBShift(
-            r_shift_limit=(20, 35),
-            g_shift_limit=(-20, 15),
-            b_shift_limit=(-25, 5),
+            r_shift_limit=(5, 5),
+            g_shift_limit=(-5, 5),
+            b_shift_limit=(-5, 5),
             feather_px=6,
             p=0.5
         ),
@@ -2796,7 +2854,7 @@ def main():
 
         ComponentSwapPaste(
             p_choose=0.25,
-            min_cc_area=10,
+            min_cc_area=80,
             margin=ROI_MARGIN,
             context_mode="distance",
             context_radius_px=14,
@@ -2839,38 +2897,46 @@ def main():
 
 
 
-    def transforms(example_batch, augmentations):
-        images, labels = [], []
-    
+    def transforms(example_batch, augmentations, make_second_view: bool):
+        images, images2, labels = [], [], []
+
         for img, lbl in zip(example_batch["pixel_values"], example_batch["label"]):
             img = np.array(Image.fromarray(np.uint8(img)).convert("RGB"))  # HWC
             lbl = np.array(Image.fromarray(np.uint8(lbl)).convert("L"))    # HW
-    
-            lbl = remap_labels(lbl).astype(np.uint8)  # binary before aug
-    
-            aug = augmentations(image=img, mask=lbl)
-        # Ensure dropout holes don't become training supervision
-            aug_img = aug["image"]
-            aug_msk = aug["mask"]
 
+            lbl = remap_labels(lbl).astype(np.uint8)  # binary before aug
+
+            aug = augmentations(image=img, mask=lbl)
+
+            aug_img = aug["image"]
+            aug_msk = aug["mask"].astype(np.uint8)
+
+            # Ensure black holes don't become training supervision
             holes = (aug_img[...,0] < 8) & (aug_img[...,1] < 8) & (aug_img[...,2] < 8)
             aug_msk = aug_msk.copy()
             aug_msk[holes] = IGNORE
 
-            aug["mask"] = aug_msk
+            images.append(aug_img)
+            labels.append(aug_msk)
 
+            # ---- second view: diffusion-like forward noise (image-only), same mask ----
+            if make_second_view:
+                img2 = diffusion_forward_u8(aug_img)   # << key line
+                images2.append(img2)
 
+        enc = processor(images, labels, return_tensors="pt")  # gives pixel_values + labels
+
+        if make_second_view:
+            enc2 = processor(images2, return_tensors="pt")    # image-only
+            enc["pixel_values_2"] = enc2["pixel_values"]      # attach second view
+
+        return enc
     
-            images.append(aug["image"])                  # HWC numpy
-            labels.append(aug["mask"].astype(np.uint8))  # HW numpy
-    
-        return processor(images, labels, return_tensors="pt")
-    
 
 
 
-    train_ds.set_transform(lambda ex: transforms(ex, train_aug))
-    eval_ds.set_transform(lambda ex: transforms(ex, val_aug))
+    train_ds.set_transform(lambda ex: transforms(ex, train_aug, make_second_view=True))
+    eval_ds.set_transform(lambda ex: transforms(ex, val_aug, make_second_view=False))
 
     # ---- Model ----
     id2label = {0: "normal", 1: "abnormality"}
