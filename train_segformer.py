@@ -94,7 +94,9 @@ def diffusion_forward_u8(img_u8: np.ndarray, t: int = None) -> np.ndarray:
     returns: HxWx3 uint8 RGB, forward-diffused (noised) version
     """
     if t is None:
-        t = np.random.randint(0, _DIFF_T)
+        # t = np.random.randint(0, _DIFF_T)
+        t_max = 250   # try 150–300
+        t = np.random.randint(0, t_max)
 
     a_bar = float(_alpha_bars[t])
     # Convert to float [0,1]
@@ -508,28 +510,63 @@ class MaskedRGBShift(A.DualTransform):
 
     
 
-class EMATeacherIgnoreTrainer(Trainer):
-    def __init__(self, *args, ema_decay=0.999, tau_pos=0.97, warmup_steps=500, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.ema_decay = float(ema_decay)
-        self.tau_pos = float(tau_pos)
-        self.warmup_steps = int(warmup_steps)
+import copy
+import torch
+import torch.nn.functional as F
+from transformers import Trainer
+import copy
+import torch
+import torch.nn.functional as F
+from transformers import Trainer
 
-        # teacher = EMA copy of the SAME model (training-time only)
+# set this to your ignore id (you used 255)
+IGNORE = 255
+
+class EMATeacherAmbiguityIgnoreTrainer(Trainer):
+    """
+    EMA teacher that masks ambiguous pixels:
+      - If teacher is high-confidence and disagrees with GT, set that pixel to IGNORE
+      - This prevents weight updates from those pixels (no gradient there)
+
+    Expected batch:
+      - pixel_values: (B,3,H,W)
+      - labels:       (B,H,W) with {0,1,IGNORE}
+    """
+
+    def __init__(
+        self,
+        *args,
+        ema_decay=0.999,
+        warmup_steps=0,
+
+        # High-confidence thresholds:
+        # p(class=1) > tau_pos  => confident positive
+        # p(class=1) < 1-tau_neg => confident negative  (i.e., p(class=0) > tau_neg)
+        tau_pos=0.97,
+        tau_neg=0.97,
+
+        # optional: only ignore if teacher is ALSO very certain overall (helps with noisy teacher early)
+        min_conf=None,   # e.g. 0.90, or None to disable
+
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.ema_decay = float(ema_decay)
+        self.warmup_steps = int(warmup_steps)
+        self.tau_pos = float(tau_pos)
+        self.tau_neg = float(tau_neg)
+        self.min_conf = None if min_conf is None else float(min_conf)
+
+        # EMA teacher = copy of student
         self.teacher = copy.deepcopy(self.model).eval()
         for p in self.teacher.parameters():
             p.requires_grad = False
 
-        # IMPORTANT: place teacher on same device as student/model
-        # self.model is already placed by Trainer later, but at init time it is usually CPU.
-        # So we will also re-place teacher in _place_model_on_device().
         self._teacher_on_device = False
 
     def _place_model_on_device(self):
-        # let Trainer place the student model
         super()._place_model_on_device()
-
-        # now place teacher on the same device
         device = next(self.model.parameters()).device
         self.teacher.to(device)
         self._teacher_on_device = True
@@ -538,7 +575,6 @@ class EMATeacherIgnoreTrainer(Trainer):
     def _ema_update(self):
         d = self.ema_decay
 
-        # Ensure teacher is on correct device even if something odd happened
         if not self._teacher_on_device:
             device = next(self.model.parameters()).device
             self.teacher.to(device)
@@ -550,8 +586,6 @@ class EMATeacherIgnoreTrainer(Trainer):
         for k in tsd.keys():
             t = tsd[k]
             m = msd[k]
-
-            # Move student tensor to teacher tensor device if needed
             if m.device != t.device:
                 m = m.to(t.device)
 
@@ -567,62 +601,57 @@ class EMATeacherIgnoreTrainer(Trainer):
         return super().training_step(model, inputs)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # --- grab and REMOVE pixel_values_2 so model(**inputs) won't see it ---
-        pixel_values_2 = inputs.pop("pixel_values_2", None)   # <<< NEW (critical)
-
         labels = inputs["labels"]
         pixel_values = inputs["pixel_values"]
 
-        # -------- your EMA teacher ignore logic (unchanged) --------
+        # ---- mask ambiguous pixels using teacher disagreement ----
         if self.state.global_step >= self.warmup_steps:
             with torch.no_grad():
                 t_out = self.teacher(pixel_values=pixel_values)
-                t_probs = torch.softmax(t_out.logits, dim=1)[:, 1]
-                t_probs = F.interpolate(
-                    t_probs.unsqueeze(1),
+                t_probs = torch.softmax(t_out.logits, dim=1)  # (B,C,h,w)
+
+                # class-1 prob at teacher resolution
+                p1 = t_probs[:, 1:2]  # (B,1,h,w)
+
+                # upsample to label size
+                p1 = F.interpolate(
+                    p1,
                     size=labels.shape[-2:],
                     mode="bilinear",
                     align_corners=False
-                ).squeeze(1)
+                ).squeeze(1)  # (B,H,W)
 
-            suspicious = (labels == 0) & (t_probs > self.tau_pos)
-            if suspicious.any():
-                labels = labels.clone()
-                labels[suspicious] = IGNORE
-                inputs["labels"] = labels
+                # confident positive / negative
+                conf_pos = p1 > self.tau_pos
+                conf_neg = p1 < (1.0 - self.tau_neg)
 
-        # -------- supervised forward (now safe) --------
+                if self.min_conf is not None:
+                    # optional: require max prob across classes to be high too
+                    pmax = torch.max(t_probs, dim=1).values  # (B,h,w)
+                    pmax = F.interpolate(
+                        pmax.unsqueeze(1),
+                        size=labels.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False
+                    ).squeeze(1)  # (B,H,W)
+                    strong = pmax >= self.min_conf
+                    conf_pos = conf_pos & strong
+                    conf_neg = conf_neg & strong
+
+                # disagreements with GT (ignore only where GT is not already IGNORE)
+                valid_gt = (labels != IGNORE)
+                disagree_pos = valid_gt & (labels == 0) & conf_pos  # teacher says 1, GT says 0
+                disagree_neg = valid_gt & (labels == 1) & conf_neg  # teacher says 0, GT says 1
+
+                if (disagree_pos.any() or disagree_neg.any()):
+                    labels = labels.clone()
+                    labels[disagree_pos | disagree_neg] = IGNORE
+                    inputs["labels"] = labels
+
+        # ---- normal supervised loss on remaining pixels ----
         outputs = model(**inputs)
-        sup_loss = outputs.loss
+        loss = outputs.loss
 
-        # -------- Option A: consistency (second view) --------
-        cons_loss = None
-        if pixel_values_2 is not None:
-            out2 = model(pixel_values=pixel_values_2)
-
-            logits1 = outputs.logits
-            logits2 = out2.logits
-
-            logits1_u = F.interpolate(logits1, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-            logits2_u = F.interpolate(logits2, size=labels.shape[-2:], mode="bilinear", align_corners=False)
-
-            valid = (labels != IGNORE)
-
-            T = 1.0
-            p1 = torch.softmax(logits1_u / T, dim=1)
-            p2 = torch.softmax(logits2_u / T, dim=1)
-            logp1 = torch.log_softmax(logits1_u / T, dim=1)
-            logp2 = torch.log_softmax(logits2_u / T, dim=1)
-
-            kl12 = (p1 * (logp1 - logp2)).sum(dim=1)
-            kl21 = (p2 * (logp2 - logp1)).sum(dim=1)
-            kl = 0.5 * (kl12 + kl21)
-
-            denom = valid.float().sum().clamp_min(1.0)
-            cons_loss = (kl * valid.float()).sum() / denom
-
-        lam = 0.2
-        loss = sup_loss if cons_loss is None else (sup_loss + lam * cons_loss)
         return (loss, outputs) if return_outputs else loss
 
     
@@ -2725,171 +2754,150 @@ def main():
 
     # ---------------- TRAIN AUG ----------------
 
+    ROI_MARGIN = 14
+
+    ROI_MARGIN = 14
+    PAD = 16  # keep your PAD if you already have one; otherwise define
+
     train_aug = A.Compose([
-            # ---- SAFE GLOBAL GEOMETRY ----
+        # ---- SAFE GLOBAL GEOMETRY ----
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.2),
         A.RandomRotate90(p=0.3),
 
         A.Affine(
-            translate_percent={"x": (-0.08, 0.08), "y": (-0.08, 0.08)},
-            scale=(0.95, 1.05),
-            rotate=(-25, 25),
+            translate_percent={"x": (-0.06, 0.06), "y": (-0.06, 0.06)},
+            scale=(0.96, 1.06),
+            rotate=(-18, 18),
             interpolation=cv2.INTER_LINEAR,
             mask_interpolation=cv2.INTER_NEAREST,
             mode=cv2.BORDER_REFLECT_101,
-            p=0.45
+            p=0.40
         ),
 
-        # ---- CONSERVATIVE LABEL FIX (DO THIS EARLY, BEFORE SHAPE-MUTATING AUGS) ----
-        # Key changes vs your current:
-        # - ignores tiny dots (min_cc_area up)
-        # - only grows within 5px neighborhood
-        # - adds only very high confidence pixels
-        # - does NOT do morphological close by default (blob-maker)
-        WhiteTissueDropout(p=0.35),
+        # ---- LABEL / MASK HANDLING ----
+        WhiteTissueDropout(
+            p=0.25  # was 0.35 (too many large white voids can change distribution)
+        ),
+
         GMMPromoteWholeTissue(
-            margin=14,
-            min_cc_area=55,
-            max_rois=4,
-            roi_max_size=256,
-            n_components=5,      # <<< do what you observed
-            seed_prob=0.85,      # 0.80–0.90 good start
-            ignore_prob=0.70,
-            intersect_dilate=7,
-            max_promote_px=8000, # safety
+            margin=ROI_MARGIN,
+            min_cc_area=80,          # ↑ reduces tiny noisy CC promotions
+            max_rois=3,              # ↓ fewer regions promoted
+            roi_max_size=224,        # ↓ smaller ROIs to prevent massive fills
+            n_components=4,          # ↓ slightly simpler
+            seed_prob=0.80,
+            ignore_prob=0.75,
+            intersect_dilate=5,      # ↓ less aggressive merging
+            max_promote_px=4500,     # ↓ huge reduction to prevent dense GT
             connect_close=True,
             close_kernel=3,
-            p=0.5
+            p=0.35                   # ↓ less frequent
         ),
 
-        # ---- COLOR / ACQUISITION REALISM (IMAGE-ONLY or mild) ----
-        A.RGBShift(r_shift_limit=14, g_shift_limit=10, b_shift_limit=14, p=0.5),
-
+        # ---- COLOR / ACQUISITION REALISM (MOVE BEFORE COPY-PASTE) ----
+        # Keep these mild; we want stain stability.
         A.OneOf([
-            A.RandomBrightnessContrast(0.08, 0.08),
-            A.ColorJitter(brightness=0.06, contrast=0.06, saturation=0.05, hue=0.02),
+            A.RandomBrightnessContrast(0.06, 0.06),
+            A.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.04, hue=0.015),
             A.GaussianBlur(blur_limit=(3, 5)),
             A.MotionBlur(blur_limit=3),
-            A.ISONoise(color_shift=(0.01, 0.15), intensity=(0.08, 0.25)),
-            A.ImageCompression(quality_lower=65, quality_upper=95),
-        ], p=0.55),
+            A.ISONoise(color_shift=(0.01, 0.10), intensity=(0.06, 0.18)),
+        ], p=0.45),
 
-        # ---- DIFFUSION LOOK: STRONGER IN IMAGE, WEAK IN MASK ----
-        # Switch to alpha_thresh + smaller radius + weaker max_alpha
-        # so you get “spread” visually without turning dots into disks.
-        DiffuseGTIntoNeighborhood(
-            radius_range=(6, 14),        # smaller than (8,28)
-            sigma_frac=(0.45, 0.75),
-            alpha_power=(1.0, 1.6),      # steeper falloff -> less mask growth
-            max_alpha=(0.20, 0.45),      # weaker blend
-            mask_mode="alpha_thresh",
-            mask_thresh=(0.65, 0.85),    # HIGH threshold = minimal mask expansion
-            p=0.55
-        ),
+        A.RGBShift(r_shift_limit=8, g_shift_limit=6, b_shift_limit=8, p=0.35),
 
-        # ---- OPTIONAL: CONNECT BROKEN LINES (MASK + IMAGE fill), BUT KEEP IT TIGHT ----
-        BridgeNearbyEndpoints(
-            max_gap_px=50,              # was 30 -> too aggressive
-            max_bridges=2,
-            line_thickness=(1, 1),      # keep thin
-            fill_image=True,
-            p=0.5
-        ),
+        # Higher quality JPEG to avoid stain destruction
+        A.ImageCompression(quality_lower=85, quality_upper=98, p=0.20),
 
-        # ---- SHAPE-MUTATING AUGS: KEEP MILD + LESS FREQUENT ----
+        # ---- COPY/PASTE (NOW AFTER COLOR) ----
+        # The big fix: no heavy feathering.
         MultiCopyPaste(
-            copies_range=(0, 2),        # was (0,5)
-            scale_range=(0.90, 1.10),   # keep close to original
-            rotate_range=(-10, 10),
-            elastic_alpha_range=(0, 450),
-            elastic_sigma_range=(0, 6),
-            allow_overlap=True,
-            feather_blend=True,
-            feather_width=10,
-            p=0.25
+            copies_range=(5, 20),
+            scale_range=(0.90, 1.25),
+            rotate_range=(-8, 8),
+            elastic_alpha_range=(0, 180),
+            elastic_sigma_range=(0, 5),
+            allow_overlap=False,     # helps avoid dense clumps
+            feather_blend=False,
+            feather_width=2,         # ✅ was 10; this preserves brown stain
+            p=0.92
         ),
-
-        GrowAlongSkeleton(
-            p_choose_cc=0.45,
-            min_cc_area=120,
-            endpoint_len_range=(1, 20),
-            thickness_range=(1, 4),
-            endpoint_count_cap=2,
-            endpoint_radius=12,
-            fill_mode="directional",   # or "brown_nearest" or "none"
-            backtrack_px=6,
-            patch_r=4,
-            p=0.30
-        ),
-
 
         ComponentScalePaste(
-            p_choose=0.6,
-            min_cc_area=120,             # avoid scaling tiny specks
+            p_choose=0.55,
+            min_cc_area=140,         # ↑ avoid tiny specks
             margin=ROI_MARGIN,
-            scale_range=(0.95, 2.3),
+            scale_range=(0.95, 1.90),# ↓ was up to 2.3 (creates unrealistic big blobs)
             context_mode="distance",
-            context_radius_px=18,       # was 50
+            context_radius_px=14,    # ↓ softer context pull
             feather_blend=True,
-            feather_width=12,
-            p=0.25
-        ),
-
-        MaskedRGBShift(
-            r_shift_limit=(5, 5),
-            g_shift_limit=(-5, 5),
-            b_shift_limit=(-5, 5),
-            feather_px=6,
-            p=0.5
-        ),
-
-        # MaskedHSVShift(
-        #     hue_shift=(-5, 5),
-        #     sat_shift=(10, 40),
-        #     val_shift=(-12, 8),
-        #     feather_px=6,
-        #     p=0.5
-        # ),
-
-        ComponentSwapPaste(
-            p_choose=0.25,
-            min_cc_area=80,
-            margin=ROI_MARGIN,
-            context_mode="distance",
-            context_radius_px=14,
-            feather_blend=True,
-            feather_width=12,
-            allow_overlap=False,
+            feather_width=3,         # ✅ keep stain
             p=0.20
         ),
 
-        # ---- LOCAL CC WARP: KEEP MILD + RARE ----
+        # ---- DIFFUSION LOOK (MAKE IT SUBTLE; PREVENT DENSE GT) ----
+        DiffuseGTIntoNeighborhood(
+            radius_range=(4, 10),        # ↓ was (6,14)
+            sigma_frac=(0.50, 0.80),
+            alpha_power=(1.0, 1.4),
+            max_alpha=(0.12, 0.28),      # ✅ was (0.20,0.45) -> too strong / densifies
+            mask_mode="alpha_thresh",
+            mask_thresh=(0.75, 0.90),    # ✅ stricter threshold -> less expansion
+            p=0.35                        # ↓ was 0.55
+        ),
+
+        # ---- CONNECTIVITY (TIGHT + RARE) ----
+        BridgeNearbyEndpoints(
+            max_gap_px=28,           # ↓ was 50 (created long fake vessels)
+            max_bridges=1,           # ↓ was 2
+            line_thickness=(1, 1),
+            fill_image=True,
+            p=0.30
+        ),
+
+        GrowAlongSkeleton(
+            p_choose_cc=0.35,        # ↓
+            min_cc_area=60,         # ↑ avoid tiny growth
+            endpoint_len_range=(1, 280),  # ↓ was up to 50
+            thickness_range=(1, 4),      # ↓ was up to 6
+            endpoint_count_cap=1,        # ↓ was 2
+            endpoint_radius=10,          # ↓
+            p=0.22
+        ),
+
+        # ---- LOCAL CC WARP (MILD + RARE) ----
         ProbabilisticComponentWarp(
-            p_choose=0.18,
-            min_cc_area=80,            # avoid tiny CCs
+            p_choose=0.15,
+            min_cc_area=120,
+            max_pick=3,
             prefer_elongated=True,
             margin=ROI_MARGIN,
             pad=PAD,
-            elastic_alpha=580,         # lower than your 250
-            elastic_sigma=3,           # slightly lower
+            elastic_alpha=220,       # ↓ was 580
+            elastic_sigma=6,
             alpha_affine=0,
             feather_blend=True,
-            feather_width=14,
-            max_pick=4,
-            p=0.25
+            feather_width=8,         # ↓ was 14
+            p=0.9
+        ),
+
+        # ---- MASKED COLOR SHIFT (KEEP SMALL; DON’T KILL STAIN) ----
+        MaskedRGBShift(
+            r_shift_limit=(-30, 30),
+            g_shift_limit=(-30, 30),
+            b_shift_limit=(-30, 30),
+            feather_px=4,
+            p=0.35
         ),
 
         # ---- PATCH NOISE (IMAGE ONLY) ----
         PatchGaussianNoise(
             num_patches_range=(1, 2),
-            patch_size_range=(48, 140),
-            noise_std_range=(6, 22),
-            p=0.35
+            patch_size_range=(48, 120),  # slightly smaller
+            noise_std_range=(5, 18),
+            p=0.22
         ),
-
-        # ---- FIX BLACK HOLES (AFTER ANY WARP/ROTATE) ----
-        # FillBlackNearest(p=0.5),
     ])
 
     
@@ -2935,7 +2943,7 @@ def main():
 
 
 
-    train_ds.set_transform(lambda ex: transforms(ex, train_aug, make_second_view=True))
+    train_ds.set_transform(lambda ex: transforms(ex, train_aug, make_second_view=False))
     eval_ds.set_transform(lambda ex: transforms(ex, val_aug, make_second_view=False))
 
     # ---- Model ----
@@ -3031,7 +3039,7 @@ def main():
             args.model_id, num_labels=2, id2label=id2label, label2id=label2id
         )
 
-    trainer = EMATeacherIgnoreTrainer(
+    trainer = EMATeacherAmbiguityIgnoreTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,
@@ -3039,7 +3047,9 @@ def main():
         compute_metrics=compute_metrics,
         ema_decay=0.999,
         tau_pos=0.97,
-        warmup_steps=500
+        tau_neg=0.97,       # optional but recommended
+        warmup_steps=500,
+        # min_conf=0.95,    # optional
     )
 
 
