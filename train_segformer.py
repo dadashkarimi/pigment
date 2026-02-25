@@ -432,17 +432,27 @@ import albumentations as A
 
 IGNORE = 255
 
+import numpy as np
+import cv2
+import albumentations as A
+
+IGNORE = 255
+
 class MaskedRGBShift(A.DualTransform):
     """
-    Apply RGBShift only inside GT (mask==1). Keeps IGNORE pixels unchanged.
-    Optionally feather edges for realism.
+    Per-connected-component RGBShift inside GT (mask==1).
+    - Each connected component gets its OWN random (r,g,b) shift.
+    - Optional feathering per component to avoid hard edges.
+    - IGNORE pixels (mask==255) are left untouched (both image + mask unchanged).
     """
     def __init__(
         self,
-        r_shift_limit=(-10, 30),
-        g_shift_limit=(-10, 20),
-        b_shift_limit=(-10, 10),
-        feather_px=6,         # 0 = hard edge, 4-12 looks nice
+        r_shift_limit=(-6, 10),
+        g_shift_limit=(-6, 8),
+        b_shift_limit=(-6, 6),
+        feather_px=6,       # 0 = hard edges; 4-10 typically looks good
+        min_cc_area=20,     # ignore tiny specks
+        connectivity=8,
         p=0.5
     ):
         super().__init__(p=p)
@@ -450,6 +460,8 @@ class MaskedRGBShift(A.DualTransform):
         self.g_shift_limit = g_shift_limit
         self.b_shift_limit = b_shift_limit
         self.feather_px = int(feather_px)
+        self.min_cc_area = int(min_cc_area)
+        self.connectivity = int(connectivity)
 
     @property
     def targets_as_params(self):
@@ -462,6 +474,7 @@ class MaskedRGBShift(A.DualTransform):
 
         img = data["image"].copy()  # uint8 RGB
         msk_u8 = data["mask"].astype(np.uint8)
+
         ignore = (msk_u8 == IGNORE)
         gt = (msk_u8 == 1)
 
@@ -469,43 +482,79 @@ class MaskedRGBShift(A.DualTransform):
             data["_masked_rgb_ok"] = 0
             return data
 
-        # random shifts (same for whole region)
-        r = int(np.random.randint(self.r_shift_limit[0], self.r_shift_limit[1] + 1))
-        g = int(np.random.randint(self.g_shift_limit[0], self.g_shift_limit[1] + 1))
-        b = int(np.random.randint(self.b_shift_limit[0], self.b_shift_limit[1] + 1))
+        H, W = gt.shape
 
-        # build alpha (optionally feather boundary)
-        alpha = gt.astype(np.float32)
-        if self.feather_px > 0:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*self.feather_px+1, 2*self.feather_px+1))
-            # make a soft band around GT
-            dil = cv2.dilate(alpha, k, 1)
-            ero = cv2.erode(alpha, k, 1)
+        # CC labeling on GT only
+        gt_u8 = gt.astype(np.uint8)
+        nlabels, labels = cv2.connectedComponents(gt_u8, connectivity=self.connectivity)
+        if nlabels <= 1:
+            data["_masked_rgb_ok"] = 0
+            return data
+
+        img_f = img.astype(np.float32)
+        out_f = img_f.copy()
+
+        shifts_used = []
+        cc_used = 0
+
+        # Helper: build soft alpha for one CC
+        def cc_alpha(cc01: np.ndarray) -> np.ndarray:
+            a = cc01.astype(np.float32)
+            if self.feather_px <= 0:
+                return a
+
+            k = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * self.feather_px + 1, 2 * self.feather_px + 1)
+            )
+
+            # core + band, then blur band for smooth feather
+            dil = cv2.dilate(a, k, 1)
+            ero = cv2.erode(a, k, 1)
             band = np.clip(dil - ero, 0, 1)
 
-            # blur band to get smooth feather
-            blur_k = max(3, 2*self.feather_px + 1)
-            if blur_k % 2 == 0: blur_k += 1
+            blur_k = max(3, 2 * self.feather_px + 1)
+            if blur_k % 2 == 0:
+                blur_k += 1
             band = cv2.GaussianBlur(band, (blur_k, blur_k), 0)
 
             alpha = np.clip(ero + band, 0, 1)
+            return alpha
 
-        alpha3 = alpha[..., None]
+        # Apply independently per CC
+        for lab in range(1, nlabels):
+            cc = (labels == lab)
+            area = int(cc.sum())
+            if area < self.min_cc_area:
+                continue
 
-        img_f = img.astype(np.float32)
-        shifted = img_f.copy()
-        shifted[..., 0] = np.clip(shifted[..., 0] + r, 0, 255)
-        shifted[..., 1] = np.clip(shifted[..., 1] + g, 0, 255)
-        shifted[..., 2] = np.clip(shifted[..., 2] + b, 0, 255)
+            r = int(np.random.randint(self.r_shift_limit[0], self.r_shift_limit[1] + 1))
+            g = int(np.random.randint(self.g_shift_limit[0], self.g_shift_limit[1] + 1))
+            b = int(np.random.randint(self.b_shift_limit[0], self.b_shift_limit[1] + 1))
 
-        out = np.clip(alpha3 * shifted + (1 - alpha3) * img_f, 0, 255).astype(np.uint8)
+            alpha = cc_alpha(cc.astype(np.uint8))
+            alpha3 = alpha[..., None]
 
-        # don't touch IGNORE pixels (optional, but consistent with your logic)
+            shifted = out_f.copy()
+            shifted[..., 0] = np.clip(shifted[..., 0] + r, 0, 255)
+            shifted[..., 1] = np.clip(shifted[..., 1] + g, 0, 255)
+            shifted[..., 2] = np.clip(shifted[..., 2] + b, 0, 255)
+
+            # Blend only for this CC region (with feather)
+            out_f = alpha3 * shifted + (1.0 - alpha3) * out_f
+
+            shifts_used.append((lab, area, r, g, b))
+            cc_used += 1
+
+        out = np.clip(out_f, 0, 255).astype(np.uint8)
+
+        # Never touch IGNORE pixels in the IMAGE
         out[ignore] = img[ignore]
 
         data["image"] = out
+        data["mask"] = msk_u8
         data["_masked_rgb_ok"] = 1
-        data["_masked_rgb_shift"] = (r, g, b)
+        data["_masked_rgb_cc_used"] = int(cc_used)
+        data["_masked_rgb_shifts"] = shifts_used  # list of (lab, area, r, g, b)
         return data
 
     
@@ -2859,7 +2908,7 @@ def main():
         GrowAlongSkeleton(
             p_choose_cc=0.35,        # ↓
             min_cc_area=60,         # ↑ avoid tiny growth
-            endpoint_len_range=(1, 280),  # ↓ was up to 50
+            endpoint_len_range=(1, 80),  # ↓ was up to 50
             thickness_range=(1, 4),      # ↓ was up to 6
             endpoint_count_cap=1,        # ↓ was 2
             endpoint_radius=10,          # ↓
@@ -2887,7 +2936,7 @@ def main():
             r_shift_limit=(-30, 30),
             g_shift_limit=(-30, 30),
             b_shift_limit=(-30, 30),
-            feather_px=4,
+            feather_px=1,
             p=0.35
         ),
 
@@ -2899,7 +2948,6 @@ def main():
             p=0.22
         ),
     ])
-
     
     val_aug = A.Compose([])  # NO randomness, NO tensorization
 
