@@ -2815,7 +2815,7 @@ def main():
         A.RandomRotate90(p=0.3),
 
         A.Affine(
-            translate_percent={"x": (-0.06, 0.06), "y": (-0.06, 0.06)},
+            translate_percent={"x": (-0.20, 0.20), "y": (-0.20, 0.20)},
             scale=(0.96, 1.06),
             rotate=(-18, 18),
             interpolation=cv2.INTER_LINEAR,
@@ -2862,7 +2862,7 @@ def main():
         # ---- COPY/PASTE (NOW AFTER COLOR) ----
         # The big fix: no heavy feathering.
         MultiCopyPaste(
-            copies_range=(5, 20),
+            copies_range=(1, 10),
             scale_range=(0.90, 1.25),
             rotate_range=(-8, 8),
             elastic_alpha_range=(0, 180),
@@ -2898,9 +2898,9 @@ def main():
 
         # ---- CONNECTIVITY (TIGHT + RARE) ----
         BridgeNearbyEndpoints(
-            max_gap_px=28,           # ↓ was 50 (created long fake vessels)
+            max_gap_px=48,           # ↓ was 50 (created long fake vessels)
             max_bridges=1,           # ↓ was 2
-            line_thickness=(1, 1),
+            line_thickness=(1, 6),
             fill_image=True,
             p=0.30
         ),
@@ -2932,13 +2932,13 @@ def main():
         ),
 
         # ---- MASKED COLOR SHIFT (KEEP SMALL; DON’T KILL STAIN) ----
-        MaskedRGBShift(
-            r_shift_limit=(-30, 30),
-            g_shift_limit=(-30, 30),
-            b_shift_limit=(-30, 30),
-            feather_px=1,
-            p=0.35
-        ),
+        # MaskedRGBShift(
+        #     r_shift_limit=(-10, 10),
+        #     g_shift_limit=(-10, 10),
+        #     b_shift_limit=(-10, 10),
+        #     feather_px=1,
+        #     p=0.35
+        # ),
 
         # ---- PATCH NOISE (IMAGE ONLY) ----
         PatchGaussianNoise(
