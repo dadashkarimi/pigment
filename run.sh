@@ -63,11 +63,11 @@ MODELS=(
 # Uncomment only the experiment(s) you want to run.
 # Each experiment is ONE run that may concatenate multiple datasets via --dataset_ids.
 EXPS=(
-    # "E1Round1|PushkarA07/2017-1-A3-dataset-new"
+  # "E1Round1|PushkarA07/2017-1-A3-dataset-new"
   # "E1Round2|PushkarA07/2017-1-A3-dataset-new PushkarA07/2016-5-A2-dataset-new PushkarA07/2016-5-P2-dataset-new"
-  # "E1Round3|PushkarA07/2017-1-A3-dataset-new PushkarA07/2016-5-A2-dataset-new PushkarA07/2016-5-P2-dataset-new PushkarA07/2016-6-A1-dataset-new"
-  # "Exp3_norm|PushkarA07/2017-1-A3-dataset-new PushkarA07/2016-6-A1-dataset-new"
-  "Exp3_unnorm|PushkarA07/2017-1-A3-dataset-new PushkarA07/2016-6-A1-unnormalized-new"
+  #"E1Round3|PushkarA07/2017-1-A3-dataset-new PushkarA07/2016-5-A2-dataset-new PushkarA07/2016-5-P2-dataset-new PushkarA07/2016-6-A1-dataset-new"
+   "Exp3_norm|PushkarA07/2017-1-A3-dataset-new PushkarA07/2016-6-A1-dataset-new"
+  #"Exp3_unnorm|PushkarA07/2017-1-A3-dataset-new PushkarA07/2016-6-A1-unnormalized-new"
 )
 
 # ---------------- Helpers ----------------
