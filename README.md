@@ -15,8 +15,6 @@ git clone https://github.com/dadashkarimi/pigment.git
 cd pigment
 ```
 
-The repository contains training and inference notebooks, training scripts, environment files, pretrained/checkpoint folders, and documentation figures.
-
 Important repository paths include:
 
 ```text
@@ -124,21 +122,29 @@ The model weights are not inferred from the slide file. They must be provided th
 
 ---
 
-## Container
+## Container Download
 
-The expected container file is:
+A prebuilt Apptainer/Singularity container is available here:
+
+```text
+https://upenn.app.box.com/s/1hponcxxvgaiqpbvekzdtf9eil0uj67i
+```
+
+Download the container from the link above and place it in the repository root as:
 
 ```text
 pigment_wsi.sif
 ```
 
-If the container is not already present after cloning, download or build it separately and place it in the repository root:
+After cloning the repository and downloading the container, the expected layout is:
 
 ```text
 pigment/
 ├── pigment_wsi.sif
 ├── segformer-rerun-equal-epochs/
 ├── docs/
+│   └── figures/
+│       └── pigment_container_outputs.png
 └── README.md
 ```
 
